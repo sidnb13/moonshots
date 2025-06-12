@@ -1,0 +1,42 @@
+# PyTorch is now automatically selected based on platform:
+# - CPU builds on macOS/Windows
+# - CUDA builds on Linux
+# 
+# For manual control, you can still use: UV_TORCH_BACKEND=auto uv sync
+
+[project]
+name = "moonshots"
+version = "0.1.0"
+description = "Testing out small scale research ideas that may not work."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "wandb",
+    "hydra-core",
+    "hydra_colorlog",
+    "omegaconf",
+    "python-dotenv",
+    "matplotlib",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+    "jupyter",
+    "pre-commit",
+    "ai_commit @ git+https://github.com/sidnb13/toolbox.git#subdirectory=src/ai_commit",
+]
+ray = [
+    "hydra-ray-jobs-launcher @ git+https://github.com/sidnb13/hydra#egg=hydra-ray-jobs-launcher&subdirectory=plugins/hydra_ray_jobs_launcher",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["moonshots"]

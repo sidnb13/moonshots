@@ -1,0 +1,28 @@
+seed: 42
+
+batch_size: 32
+num_examples_per_task: 100
+lr: 0.001
+opt_type: adam
+steps: 1000
+max_grad_norm: 1.0
+device: mps
+
+wandb:
+  log: true
+  project: mixed_batching
+  entity: ${oc.env:WANDB_ENTITY,null}
+  run_name: ${oc.env:WANDB_RUN_NAME,null}
+  run_id: ${oc.env:WANDB_RUN_ID,null}
+  group: ${oc.env:WANDB_GROUP,null}
+  tags: ${oc.env:WANDB_TAGS,null}
+  notes: ${oc.env:WANDB_NOTES,null}
+
+# Task setup
+train_mode: sequential # mixed_batch, sequential
+num_tasks: 10
+val_interval: 100  # Validate every 100 steps
+
+n_features: 20
+hidden_dim: 64
+assets_dir: assets  # Directory to save plots and other assets
