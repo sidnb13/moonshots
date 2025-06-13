@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from sklearn.datasets import make_classification
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
 from torch import nn
@@ -16,13 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import wandb
-
-
-def set_seed(seed: int):
-    torch.manual_seed(seed)
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    return generator
+from utils import LoggerAggregator, set_seed
 
 
 def make_opt(model, cfg: DictConfig):
@@ -68,42 +62,6 @@ class Dictionary(nn.Module):
         out = h2 @ l3_wei
 
         return F.sigmoid(out.squeeze(-1))
-
-
-class LoggerAggregator:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.history = []  # Optional: keep a simple list of all logs for debugging
-        if cfg.wandb.log:
-            wandb.init(
-                project=cfg.wandb.project,
-                entity=cfg.wandb.entity,
-                name=cfg.wandb.run_name,
-                id=cfg.wandb.run_id,
-                group=cfg.wandb.group,
-                tags=cfg.wandb.tags,
-                notes=cfg.wandb.notes,
-            )
-            wandb.config.update(OmegaConf.to_container(cfg))
-            wandb.run.name = cfg.wandb.run_name
-
-    def log_dict(self, log_dict, section=None, kind="scalar", step=None):
-        # log_dict: {key: value, ...}
-        # Optionally store in local history for debugging
-        for key, value in log_dict.items():
-            self.history.append(
-                {
-                    "section": section,
-                    "key": key,
-                    "value": value,
-                    "kind": kind,
-                    "step": step,
-                }
-            )
-        if self.cfg.wandb.log:
-            if section is not None:
-                log_dict = {f"{section}/{k}": v for k, v in log_dict.items()}
-            wandb.log(log_dict)
 
 
 def balance_loss(loss: torch.Tensor, task_ids: torch.Tensor):
@@ -438,7 +396,7 @@ def train_mixed_batch(cfg: DictConfig, generator: torch.Generator):
     pbar.close()
 
 
-@hydra.main(config_path="../config", config_name="mixed_batching", version_base=None)
+@hydra.main(config_path="config", config_name="mixed_batching", version_base=None)
 def main(cfg: DictConfig):
     generator = set_seed(cfg.seed)
 
