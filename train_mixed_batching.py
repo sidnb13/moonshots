@@ -108,9 +108,8 @@ class ClassificationTaskDataset(Dataset):
         self.task_id = task_id
 
         # generate a global multiclass dataset
-        N = examples_per_task * n_tasks
         X, y = make_classification(
-            n_samples=N,
+            n_samples=examples_per_task,
             n_features=n_features,
             n_informative=max(2, n_features // 2),
             n_redundant=0,
@@ -121,8 +120,8 @@ class ClassificationTaskDataset(Dataset):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y_global = torch.tensor(y, dtype=torch.long)
 
-        self.total_examples = N
-        self.flattened_len = N * n_tasks
+        self.total_examples = examples_per_task
+        self.flattened_len = examples_per_task * n_tasks
 
     def __len__(self):
         if self.mode == "per_task":
@@ -136,6 +135,7 @@ class ClassificationTaskDataset(Dataset):
         tid = idx % self.n_tasks
         x = self.X[example_idx]
         y = (self.y_global[example_idx] == tid).float().unsqueeze(-1)
+
         return x, y, tid
 
 

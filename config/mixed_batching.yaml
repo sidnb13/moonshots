@@ -1,10 +1,10 @@
 seed: 42
 
-batch_size: 32
-num_examples_per_task: 100
+batch_size: 64
+num_examples_per_task: 10000
 lr: 0.001
-opt_type: adam
-steps: 1000
+opt_type: sgd
+steps: 10000
 max_grad_norm: 1.0
 device: mps
 
