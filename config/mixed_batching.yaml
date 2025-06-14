@@ -1,7 +1,9 @@
 seed: 42
 
-batch_size: 64
-num_examples_per_task: 10000
+batch_size: 128
+num_examples_per_task_train: 10000
+num_examples_per_task_val: 500
+num_examples_per_task_test: 1000
 lr: 0.001
 opt_type: sgd
 steps: 10000
