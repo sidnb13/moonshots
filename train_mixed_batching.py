@@ -1,6 +1,8 @@
 import itertools
 import os
-from typing import Literal
+import random
+import time
+from typing import Optional
 
 import hydra
 import matplotlib.pyplot as plt
@@ -22,7 +24,14 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import wandb
-from utils import LoggerAggregator, set_seed
+from utils import (
+    LoggerAggregator,
+    ProfilingContext,
+    WarmupContext,
+    get_ordinal_device,
+    profile_and_log_flamegraph,
+    set_seed,
+)
 
 
 def make_opt(model, cfg: DictConfig):
@@ -36,19 +45,26 @@ def make_opt(model, cfg: DictConfig):
         return Adagrad(model.parameters(), lr=lr)
     elif opt_type == "rmsprop":
         return RMSprop(model.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer type: {opt_type}")
 
 
 class Dictionary(nn.Module):
-    def __init__(self, num_tasks: int, n_features: int, hidden_dim: int = 64):
+    def __init__(
+        self,
+        num_tasks: int,
+        n_features: int,
+        hidden_dim: int = 64,
+        device: torch.device | None = None,
+    ):
         super().__init__()
         self.num_tasks = num_tasks
         self.n_features = n_features
         self.hidden_dim = hidden_dim
-        self._l1_emb = nn.Embedding(num_tasks, hidden_dim * n_features)
-        # Simplified 2-layer per-task network: input->hidden, hidden->scalar head
-        self._l1_bias = nn.Embedding(num_tasks, hidden_dim)
-        self._l2_emb = nn.Embedding(num_tasks, hidden_dim)
-        self._l2_bias = nn.Embedding(num_tasks, 1)
+        self._l1_emb = nn.Embedding(num_tasks, hidden_dim * n_features, device=device)
+        self._l1_bias = nn.Embedding(num_tasks, hidden_dim, device=device)
+        self._l2_emb = nn.Embedding(num_tasks, hidden_dim, device=device)
+        self._l2_bias = nn.Embedding(num_tasks, 1, device=device)
         self.act_fn = nn.GELU()
 
     def forward(self, x, task_ids):
@@ -71,18 +87,22 @@ def balance_loss(loss: torch.Tensor, task_ids: torch.Tensor):
     task_ids:  [B] ∈ {0,…,num_tasks-1}
     num_tasks: total C
     """
-
-    counts = torch.zeros(max(task_ids) + 1, device=loss.device, dtype=loss.dtype)
+    # TODO: this is probably pretty inefficient, we can pre-allocate
+    # a buffer once and reuse/keep it sparse or something
+    counts = torch.zeros(
+        int(task_ids.max().item()) + 1, device=loss.device, dtype=loss.dtype
+    )
     counts = counts.scatter_add_(0, task_ids, torch.ones_like(loss))
     per_sample_w = 1.0 / counts[task_ids]
     return loss * per_sample_w
 
 
-def compute_loss(y_pred, y_true, task_ids: torch.LongTensor = None):
+def compute_loss(y_pred, y_true, task_ids: Optional[torch.LongTensor] = None):
     bce_loss = F.binary_cross_entropy_with_logits(
         y_pred, y_true, reduction="none"
     ).squeeze(-1)
-    bce_loss = balance_loss(bce_loss, task_ids)
+    if task_ids is not None:
+        bce_loss = balance_loss(bce_loss, task_ids)
     return bce_loss.mean()
 
 
@@ -102,60 +122,92 @@ class ClassificationTaskDataset(Dataset):
         self.total_per_task = total_examples_per_task
         self.n_feat = n_features
 
-        # generate a balanced multiclass dataset (larger to accommodate splits)
-        X, y = make_classification(
-            n_samples=total_examples_per_task * n_tasks,
-            n_features=n_features,
-            n_informative=max(2, n_features // 2),
-            n_redundant=0,
-            n_classes=n_tasks,
-            flip_y=0.01,
-            random_state=random_state,
-        )
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y_global = torch.tensor(y, dtype=torch.long)
-
-        # build indices for balanced binary tasks
-        import random
         random.seed(random_state)
+        start_time = time.time()
 
-        self.indices = []
-        for tid in range(self.n_tasks):
-            pos_idx = (self.y_global == tid).nonzero(as_tuple=True)[0].tolist()
-            neg_idx = (self.y_global != tid).nonzero(as_tuple=True)[0].tolist()
-            neg_sample = random.sample(neg_idx, k=total_examples_per_task)
-            
-            # Add positive examples
-            for idx_ in pos_idx:
-                self.indices.append((idx_, tid, 1.0))
-            # Add negative examples
+        if n_tasks == 1:
+            # Special case: single binary task
+            X, y = make_classification(
+                n_samples=total_examples_per_task
+                * 2,  # ensure enough positives/negatives
+                n_features=n_features,
+                n_informative=max(2, n_features // 2),
+                n_redundant=0,
+                n_classes=2,
+                flip_y=0.01,
+                random_state=random_state,
+            )
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.y_global = torch.tensor(y, dtype=torch.long)
+            # For the only task (tid=0), class 1 is positive, class 0 is negative
+            pos_idx = (self.y_global == 1).nonzero(as_tuple=True)[0].tolist()
+            neg_idx = (self.y_global == 0).nonzero(as_tuple=True)[0].tolist()
+            # Sample to balance
+            n_pos = min(len(pos_idx), total_examples_per_task)
+            n_neg = min(len(neg_idx), total_examples_per_task)
+            pos_sample = random.sample(pos_idx, k=n_pos)
+            neg_sample = random.sample(neg_idx, k=n_neg)
+            self.indices = []
+            for idx_ in pos_sample:
+                self.indices.append((idx_, 0, 1.0))
             for idx_ in neg_sample:
-                self.indices.append((idx_, tid, 0.0))
-        
+                self.indices.append((idx_, 0, 0.0))
+        else:
+            # generate a balanced multiclass dataset (larger to accommodate splits)
+            X, y = make_classification(
+                n_samples=total_examples_per_task * n_tasks,
+                n_features=n_features,
+                n_informative=max(2, n_features // 2),
+                n_redundant=0,
+                n_classes=n_tasks,
+                flip_y=0.01,
+                random_state=random_state,
+            )
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.y_global = torch.tensor(y, dtype=torch.long)
+            self.indices = []
+            for tid in tqdm(
+                range(self.n_tasks), desc="Building ClassificationTaskDataset"
+            ):
+                pos_idx = (self.y_global == tid).nonzero(as_tuple=True)[0].tolist()
+                neg_idx = (self.y_global != tid).nonzero(as_tuple=True)[0].tolist()
+                neg_sample = random.sample(neg_idx, k=total_examples_per_task)
+                # Add positive examples
+                for idx_ in pos_idx:
+                    self.indices.append((idx_, tid, 1.0))
+                # Add negative examples
+                for idx_ in neg_sample:
+                    self.indices.append((idx_, tid, 0.0))
         random.shuffle(self.indices)
+
+        elapsed = time.time() - start_time
+        print(
+            f"ClassificationTaskDataset generated in {elapsed:.2f}s with {len(self.indices)} examples"
+        )
 
     def split_dataset(self, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2):
         """Split the dataset into train/val/test portions while maintaining task balance."""
-        assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
-        
+        assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, (
+            "Ratios must sum to 1.0"
+        )
+
         # Group indices by task to ensure balanced splits
         task_indices = {tid: [] for tid in range(self.n_tasks)}
         for i, (idx, tid, label) in enumerate(self.indices):
             task_indices[tid].append(i)
-        
+
         train_indices, val_indices, test_indices = [], [], []
-        
+
         for tid in range(self.n_tasks):
             task_data = task_indices[tid]
             n_total = len(task_data)
             n_train = int(n_total * train_ratio)
             n_val = int(n_total * val_ratio)
-            n_test = n_total - n_train - n_val  # remainder goes to test
-            
+
             train_indices.extend(task_data[:n_train])
-            val_indices.extend(task_data[n_train:n_train + n_val])
-            test_indices.extend(task_data[n_train + n_val:])
-        
+            val_indices.extend(task_data[n_train : n_train + n_val])
+            test_indices.extend(task_data[n_train + n_val :])
+
         return train_indices, val_indices, test_indices
 
     def __len__(self):
@@ -170,13 +222,14 @@ class ClassificationTaskDataset(Dataset):
 
 class DatasetSplit(Dataset):
     """A subset of a dataset defined by indices."""
+
     def __init__(self, dataset, indices):
         self.dataset = dataset
         self.indices = indices
-    
+
     def __len__(self):
         return len(self.indices)
-    
+
     def __getitem__(self, idx):
         return self.dataset[self.indices[idx]]
 
@@ -186,15 +239,22 @@ def collate_fn(batch):
     return torch.stack(x), torch.stack(y), torch.tensor(task_id)
 
 
+def print_split_stats(dataset, indices, name):
+    y_vals = [dataset.indices[i][2] for i in indices]
+    pos = sum(1 for y in y_vals if y == 1.0)
+    neg = sum(1 for y in y_vals if y == 0.0)
+    print(f"{name}: Positives={pos}, Negatives={neg}, Total={len(indices)}")
+
+
 def make_dataloaders(cfg: DictConfig):
     """Create train/val/test dataloaders from a single dataset split."""
     # Calculate total examples needed
     total_examples_per_task = (
-        cfg.num_examples_per_task_train + 
-        cfg.num_examples_per_task_val + 
-        cfg.num_examples_per_task_test
+        cfg.num_examples_per_task_train
+        + cfg.num_examples_per_task_val
+        + cfg.num_examples_per_task_test
     )
-    
+
     # Create the full dataset
     full_dataset = ClassificationTaskDataset(
         n_tasks=cfg.num_tasks,
@@ -202,45 +262,59 @@ def make_dataloaders(cfg: DictConfig):
         n_features=cfg.n_features,
         random_state=cfg.seed,
     )
-    
+
     # Calculate split ratios based on the desired sizes
     train_ratio = cfg.num_examples_per_task_train / total_examples_per_task
     val_ratio = cfg.num_examples_per_task_val / total_examples_per_task
     test_ratio = cfg.num_examples_per_task_test / total_examples_per_task
-    
+
     # Split the dataset
     train_indices, val_indices, test_indices = full_dataset.split_dataset(
-        train_ratio=train_ratio, 
-        val_ratio=val_ratio, 
-        test_ratio=test_ratio
+        train_ratio=train_ratio, val_ratio=val_ratio, test_ratio=test_ratio
     )
-    
+
+    # Print class balance stats
+    print_split_stats(full_dataset, train_indices, "Train")
+    print_split_stats(full_dataset, val_indices, "Val")
+    print_split_stats(full_dataset, test_indices, "Test")
+
     # Create dataset splits
     train_dataset = DatasetSplit(full_dataset, train_indices)
     val_dataset = DatasetSplit(full_dataset, val_indices)
     test_dataset = DatasetSplit(full_dataset, test_indices)
-    
+
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=cfg.batch_size, 
-        shuffle=True, 
-        collate_fn=collate_fn
+        train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=cfg.batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn
+        val_dataset, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_fn
     )
     test_loader = DataLoader(
-        test_dataset, 
-        batch_size=cfg.batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn
+        test_dataset, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_fn
     )
-    
+
     return train_loader, val_loader, test_loader
+
+
+def training_step_mixed_batch(model, batch, cfg):
+    """Training step for mixed batch mode."""
+    x, y, task_id = batch
+    y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
+    loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
+    loss /= cfg.gradient_accumulation_steps
+    loss.backward()
+    return loss
+
+
+def training_step_sequential(model, batch, cfg):
+    """Training step for sequential mode."""
+    x, y, task_id_batch = batch
+    y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
+    loss = compute_loss(y_pred, y.to(cfg.device), task_id_batch.to(cfg.device))
+    loss /= cfg.gradient_accumulation_steps
+    loss.backward()
+    return loss
 
 
 def train_one_task(
@@ -249,17 +323,50 @@ def train_one_task(
     opt = make_opt(model, cfg)
     step = 0
     train_iter = itertools.cycle(train_loader)
-    total_steps = cfg.steps
+    if cfg.steps > 0:
+        total_steps = cfg.steps
+        print(f"[train_one_task] Using steps mode: {total_steps} steps")
+    else:
+        total_steps = cfg.epochs * len(train_loader)
+        print(
+            f"[train_one_task] Using epochs mode: {cfg.epochs} epochs, {total_steps} steps"
+        )
     pbar = tqdm(range(total_steps), desc=f"Task {task_id} (steps)")
+    profile_interval = getattr(cfg, "profile_interval", 1000)
     while step < total_steps:
         model.train()
         x, y, task_id_batch = next(train_iter)
+        batch_size = x.shape[0]
+        enable_profiler = step % profile_interval == 0 and step > 0
 
-        y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
-
-        loss = compute_loss(y_pred, y.to(cfg.device), task_id_batch.to(cfg.device))
-        loss.backward()
-        opt.step()
+        # Use WarmupContext for profiling
+        if enable_profiler:
+            with WarmupContext(
+                model, train_iter, cfg, training_step_fn=training_step_sequential
+            ):
+                with ProfilingContext(batch_size, step, cfg, enable_profiler=True):
+                    y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
+                    loss = compute_loss(
+                        y_pred, y.to(cfg.device), task_id_batch.to(cfg.device)
+                    )
+                    loss /= cfg.gradient_accumulation_steps
+                    if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                        loss.backward()
+                        opt.step()
+                        opt.zero_grad()
+                    else:
+                        loss.backward()
+        else:
+            # Normal training step without profiling
+            y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
+            loss = compute_loss(y_pred, y.to(cfg.device), task_id_batch.to(cfg.device))
+            loss /= cfg.gradient_accumulation_steps
+            if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                loss.backward()
+                opt.step()
+                opt.zero_grad()
+            else:
+                loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg.max_grad_norm
         )
@@ -273,7 +380,18 @@ def train_one_task(
             kind="scalar",
             step=step,
         )
-        opt.zero_grad()
+        if enable_profiler:
+            results = getattr(ProfilingContext, "results", None)
+            if results:
+                logger.log_dict(
+                    results,
+                    section="profile",
+                    kind="scalar",
+                    step=step,
+                )
+                print(
+                    f"[PROFILE] Step {step}: {results['examples_per_sec']:.2f} ex/s, {results['step_time_cuda_sync']:.4f} s/step, {results['flops_per_sec'] if results['flops_per_sec'] != -1 else 'N/A'} flops/s"
+                )
         pbar.set_postfix({"loss": f"{loss.item():.4f}", "step": step})
         pbar.update(1)
         step += 1
@@ -305,7 +423,11 @@ def train_one_task(
                 step=step,
             )
     pbar.close()
-
+    # --- Profile and log final flamegraph ---
+    example_batch = next(iter(val_loader))
+    profile_and_log_flamegraph(
+        model, example_batch, cfg, logger, compute_loss=compute_loss
+    )
     return {}
 
 
@@ -329,7 +451,7 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
     task_ids = np.concatenate(all_task_ids).ravel()
 
     # Overall metrics
-    acc = accuracy_score(y_true, (y_pred > 0.0).astype(float))
+    acc = accuracy_score(y_true, (y_pred > 0.5).astype(float))
     auc = roc_auc_score(y_true, y_pred)
     fpr, tpr, _ = roc_curve(y_true, y_pred)
 
@@ -373,6 +495,30 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
     )
     plt.savefig(plot_path)
     plt.close()
+
+    # Save per-task accuracy bar plot
+    if len(task_metrics) > 0:
+        plt.figure()
+        task_names = list(task_metrics.keys())
+        accuracies = [task_metrics[k]["accuracy"] for k in task_names]
+        plt.bar(task_names, accuracies)
+        plt.ylabel("Accuracy")
+        plt.ylim(0, 1)
+        plt.title(
+            f"Per-Task Test Accuracy - {'All Tasks' if task_id is None else f'Task {task_id}'}"
+        )
+        plt.xticks(rotation=45)
+        bar_path = os.path.join(
+            assets_dir,
+            f"accuracy_bar_{'all_tasks' if task_id is None else f'task_{task_id}'}.png",
+        )
+        plt.tight_layout()
+        plt.savefig(bar_path)
+        plt.close()
+        # Log to wandb if enabled
+        if cfg.wandb.log:
+            bar_key = f"test/accuracy_bar_{'all_tasks' if task_id is None else f'task_{task_id}'}"
+            wandb.log({bar_key: wandb.Image(bar_path)})
 
     # Save overlay ROC curve for all tasks
     if len(roc_curves) > 0:
@@ -425,7 +571,11 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
 
 def train_sequential(cfg: DictConfig):
     """Train a classifier for each task sequentially."""
-    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim).to(cfg.device)
+    # Init on device
+    if torch.cuda.is_available():
+        device = get_ordinal_device(cfg.device)
+        torch.cuda.set_device(device)
+    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)
     train_loader, val_loader, test_loader = make_dataloaders(cfg)
 
     logger = LoggerAggregator(cfg)
@@ -446,20 +596,63 @@ def train_sequential(cfg: DictConfig):
 
 def train_mixed_batch(cfg: DictConfig):
     """Train a library of classifers for all tasks in a single batch, step-based."""
-    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim).to(cfg.device)
+    # Init on device
+    if torch.cuda.is_available():
+        device = get_ordinal_device(cfg.device)
+        torch.cuda.set_device(device)
+
+    breakpoint()
+
+    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)
     train_loader, val_loader, test_loader = make_dataloaders(cfg)
     logger = LoggerAggregator(cfg)
     opt = make_opt(model, cfg)
     step = 0
     train_iter = itertools.cycle(train_loader)
-    total_steps = cfg.steps
+    if cfg.steps > 0:
+        total_steps = cfg.steps
+        print(f"[train_mixed_batch] Using steps mode: {total_steps} steps")
+    else:
+        total_steps = cfg.epochs * len(train_loader)
+        print(
+            f"[train_mixed_batch] Using epochs mode: {cfg.epochs} epochs, {total_steps} steps"
+        )
     pbar = tqdm(range(total_steps), desc="Training (steps)")
+    profile_interval = getattr(cfg, "profile_interval", 1000)
     while step < total_steps:
         model.train()
         x, y, task_id = next(train_iter)
-        y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
-        loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
-        loss.backward()
+        batch_size = x.shape[0]
+        enable_profiler = step % profile_interval == 0 and step > 0
+
+        # Use WarmupContext for profiling
+        if enable_profiler:
+            with WarmupContext(
+                model, train_iter, cfg, training_step_fn=training_step_mixed_batch
+            ):
+                with ProfilingContext(batch_size, step, cfg, enable_profiler=True):
+                    y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
+                    loss = compute_loss(
+                        y_pred, y.to(cfg.device), task_id.to(cfg.device)
+                    )
+                    loss /= cfg.gradient_accumulation_steps
+                    if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                        loss.backward()
+                        opt.step()
+                        opt.zero_grad()
+                    else:
+                        loss.backward()
+        else:
+            # Normal training step without profiling
+            y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
+            loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
+            loss /= cfg.gradient_accumulation_steps
+            if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                loss.backward()
+                opt.step()
+                opt.zero_grad()
+            else:
+                loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg.max_grad_norm
         )
@@ -473,8 +666,18 @@ def train_mixed_batch(cfg: DictConfig):
             kind="scalar",
             step=step,
         )
-        opt.step()
-        opt.zero_grad()
+        if enable_profiler:
+            results = getattr(ProfilingContext, "results", None)
+            if results:
+                logger.log_dict(
+                    results,
+                    section="profile",
+                    kind="scalar",
+                    step=step,
+                )
+                print(
+                    f"[PROFILE] Step {step}: {results['examples_per_sec']:.2f} ex/s, {results['step_time_cuda_sync']:.4f} s/step, {results['flops_per_sec'] if results['flops_per_sec'] != -1 else 'N/A'} flops/s"
+                )
         pbar.set_postfix({"loss": f"{loss.item():.4f}", "step": step})
         pbar.update(1)
         step += 1
@@ -519,10 +722,28 @@ def train_mixed_batch(cfg: DictConfig):
         print(f"\n{task_id}:")
         print(f"Accuracy: {task_metrics['accuracy']:.4f}")
         print(f"AUC: {task_metrics['auc']:.4f}")
+    # --- Profile and log final flamegraph ---
+    example_batch = next(iter(test_loader))
+    profile_and_log_flamegraph(
+        model, example_batch, cfg, logger, compute_loss=compute_loss
+    )
 
 
 @hydra.main(config_path="config", config_name="mixed_batching", version_base=None)
 def main(cfg: DictConfig):
+    # Dynamically set wandb run name BEFORE any wandb or logger usage
+    n_tasks = cfg.num_tasks
+    batch_size = cfg.batch_size
+    lr = cfg.lr
+    opt_type = cfg.opt_type
+    train_mode = cfg.train_mode
+    if cfg.steps > 0:
+        steps_or_epochs = f"{cfg.steps}steps"
+    else:
+        steps_or_epochs = f"{cfg.epochs}epochs"
+    run_name = f"{n_tasks}tasks_{steps_or_epochs}_bs{batch_size}_lr{lr}_{opt_type}_{train_mode}"
+    cfg.wandb.run_name = run_name
+
     set_seed(cfg.seed)
 
     if cfg.train_mode == "sequential":

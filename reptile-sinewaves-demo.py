@@ -1,3 +1,5 @@
+"""original credit to: https://gist.github.com/joschu/f503500cda64f2ce87c8288906b09e2d#file-reptile-sinewaves-demo-py"""
+
 from copy import deepcopy
 
 import matplotlib.pyplot as plt

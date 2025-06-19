@@ -1,12 +1,16 @@
 seed: 42
 
 batch_size: 128
+gradient_accumulation_steps: 1
 num_examples_per_task_train: 10000
 num_examples_per_task_val: 500
 num_examples_per_task_test: 1000
 lr: 0.001
-opt_type: sgd
-steps: 10000
+opt_type: adam
+# Number of epochs to train (used if steps == -1)
+epochs: 10
+# Number of steps to train (if > 0, overrides epochs)
+steps: -1
 max_grad_norm: 1.0
 device: mps
 
@@ -28,3 +32,7 @@ val_interval: 100  # Validate every 100 steps
 n_features: 20
 hidden_dim: 64
 assets_dir: assets  # Directory to save plots and other assets
+
+profile_interval: 1000  # Run profiling every 1000 steps
+
+profiler_dir: profiler_traces  # Directory for torch.profiler traces
