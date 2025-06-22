@@ -17,6 +17,7 @@ hidden_dim: 64
 activation: tanh  # tanh or relu
 intermediate_dim: 128
 hyper_input_dim: 32
+hypernet_lr: 0.001  # Learning rate for hypernetwork optimizer
 
 # Device
 device: cpu
@@ -38,3 +39,9 @@ save_plots: true
 plot_interval: 1000  # Plot every N iterations
 inner_plot_steps: 32
 plot_inner_interval: 8
+
+mode: reptile  # Options: 'reptile' or 'hypernet'
+
+num_tasks: 10  # Number of tasks for hypernet
+val_interval: 1000  # Validation interval for hypernet
+input_cond: false  # Whether to use input conditioning in hypernet
