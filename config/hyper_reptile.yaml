@@ -15,6 +15,8 @@ ntrain: 10  # Size of training minibatches
 # Model parameters
 hidden_dim: 64
 activation: tanh  # tanh or relu
+intermediate_dim: 128
+hyper_input_dim: 32
 
 # Device
 device: cpu
