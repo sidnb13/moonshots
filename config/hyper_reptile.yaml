@@ -1,0 +1,36 @@
+seed: 0
+plot: true
+
+# Meta-learning parameters
+innerstepsize: 0.02  # stepsize in inner SGD
+innerepochs: 1  # number of epochs of each inner SGD
+outerstepsize0: 0.1  # stepsize of outer optimization, i.e., meta-optimization
+niterations: 30000  # number of outer updates; each iteration we sample one task and update on it
+
+# Task generation parameters
+x_min: -5
+x_max: 5
+x_points: 50
+ntrain: 10  # Size of training minibatches
+
+# Model parameters
+hidden_dim: 64
+activation: tanh  # tanh or relu
+
+# Device
+device: cpu
+
+# Logging
+wandb:
+  log: false
+  project: hyper_reptile
+  entity: ${oc.env:WANDB_ENTITY,null}
+  run_name: ${oc.env:WANDB_RUN_NAME,null}
+  run_id: ${oc.env:WANDB_RUN_ID,null}
+  group: ${oc.env:WANDB_GROUP,null}
+  tags: ${oc.env:WANDB_TAGS,null}
+  notes: ${oc.env:WANDB_NOTES,null}
+
+# Output
+assets_dir: assets
+plot_interval: 1000  # Plot every N iterations

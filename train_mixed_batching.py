@@ -2,13 +2,13 @@ import itertools
 import os
 import random
 import time
-from typing import Optional
 
 import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 from sklearn.datasets import make_classification
@@ -23,13 +23,13 @@ from torch.optim import SGD, Adagrad, Adam, RMSprop
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-import wandb
 from utils import (
     LoggerAggregator,
     ProfilingContext,
     WarmupContext,
-    get_ordinal_device,
+    _resolve_device,
     profile_and_log_flamegraph,
+    profile_and_log_flamegraph_backward,
     set_seed,
 )
 
@@ -81,28 +81,30 @@ class Dictionary(nn.Module):
         return logits.unsqueeze(-1)
 
 
-def balance_loss(loss: torch.Tensor, task_ids: torch.Tensor):
+def balance_loss(loss: torch.Tensor, task_ids: torch.Tensor, num_tasks: int):
     """
     loss:      [B] per-sample loss (reduction='none')
     task_ids:  [B] ∈ {0,…,num_tasks-1}
     num_tasks: total C
     """
-    # TODO: this is probably pretty inefficient, we can pre-allocate
-    # a buffer once and reuse/keep it sparse or something
-    counts = torch.zeros(
-        int(task_ids.max().item()) + 1, device=loss.device, dtype=loss.dtype
-    )
-    counts = counts.scatter_add_(0, task_ids, torch.ones_like(loss))
-    per_sample_w = 1.0 / counts[task_ids]
-    return loss * per_sample_w
+    counts = torch.bincount(task_ids, minlength=num_tasks).to(loss.dtype)
+    return loss / counts[task_ids]
 
 
-def compute_loss(y_pred, y_true, task_ids: Optional[torch.LongTensor] = None):
+def compute_loss(
+    y_pred, y_true, task_ids: torch.LongTensor | None = None, num_tasks: int = 1
+):
+    """
+    y_pred: [B, 1]
+    y_true: [B, 1]
+    task_ids: [B] ∈ {0,…,num_tasks-1}
+    num_tasks: total C
+    """
     bce_loss = F.binary_cross_entropy_with_logits(
         y_pred, y_true, reduction="none"
     ).squeeze(-1)
     if task_ids is not None:
-        bce_loss = balance_loss(bce_loss, task_ids)
+        bce_loss = balance_loss(bce_loss, task_ids, num_tasks=num_tasks)
     return bce_loss.mean()
 
 
@@ -123,6 +125,7 @@ class ClassificationTaskDataset(Dataset):
         self.n_feat = n_features
 
         random.seed(random_state)
+        np.random.seed(random_state)
         start_time = time.time()
 
         if n_tasks == 1:
@@ -166,12 +169,18 @@ class ClassificationTaskDataset(Dataset):
             self.X = torch.tensor(X, dtype=torch.float32)
             self.y_global = torch.tensor(y, dtype=torch.long)
             self.indices = []
+
+            y_np = self.y_global.numpy()
+            all_indices = np.arange(len(y_np))
+
             for tid in tqdm(
                 range(self.n_tasks), desc="Building ClassificationTaskDataset"
             ):
-                pos_idx = (self.y_global == tid).nonzero(as_tuple=True)[0].tolist()
-                neg_idx = (self.y_global != tid).nonzero(as_tuple=True)[0].tolist()
-                neg_sample = random.sample(neg_idx, k=total_examples_per_task)
+                pos_idx = all_indices[y_np == tid]
+                neg_idx = all_indices[y_np != tid]
+                neg_sample = np.random.choice(
+                    neg_idx, size=total_examples_per_task, replace=False
+                )
                 # Add positive examples
                 for idx_ in pos_idx:
                     self.indices.append((idx_, tid, 1.0))
@@ -301,7 +310,7 @@ def training_step_mixed_batch(model, batch, cfg):
     """Training step for mixed batch mode."""
     x, y, task_id = batch
     y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
-    loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
+    loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device), cfg.num_tasks)
     loss /= cfg.gradient_accumulation_steps
     loss.backward()
     return loss
@@ -311,7 +320,9 @@ def training_step_sequential(model, batch, cfg):
     """Training step for sequential mode."""
     x, y, task_id_batch = batch
     y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
-    loss = compute_loss(y_pred, y.to(cfg.device), task_id_batch.to(cfg.device))
+    loss = compute_loss(
+        y_pred, y.to(cfg.device), task_id_batch.to(cfg.device), cfg.num_tasks
+    )
     loss /= cfg.gradient_accumulation_steps
     loss.backward()
     return loss
@@ -347,7 +358,10 @@ def train_one_task(
                 with ProfilingContext(batch_size, step, cfg, enable_profiler=True):
                     y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
                     loss = compute_loss(
-                        y_pred, y.to(cfg.device), task_id_batch.to(cfg.device)
+                        y_pred,
+                        y.to(cfg.device),
+                        task_id_batch.to(cfg.device),
+                        cfg.num_tasks,
                     )
                     loss /= cfg.gradient_accumulation_steps
                     if (step + 1) % cfg.gradient_accumulation_steps == 0:
@@ -359,7 +373,9 @@ def train_one_task(
         else:
             # Normal training step without profiling
             y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
-            loss = compute_loss(y_pred, y.to(cfg.device), task_id_batch.to(cfg.device))
+            loss = compute_loss(
+                y_pred, y.to(cfg.device), task_id_batch.to(cfg.device), cfg.num_tasks
+            )
             loss /= cfg.gradient_accumulation_steps
             if (step + 1) % cfg.gradient_accumulation_steps == 0:
                 loss.backward()
@@ -406,7 +422,10 @@ def train_one_task(
                     x, y, task_id_batch = batch
                     y_pred = model(x.to(cfg.device), task_id_batch.to(cfg.device))
                     batch_val_loss = compute_loss(
-                        y_pred, y.to(cfg.device), task_id_batch.to(cfg.device)
+                        y_pred,
+                        y.to(cfg.device),
+                        task_id_batch.to(cfg.device),
+                        cfg.num_tasks,
                     ).item()
                     val_loss += batch_val_loss
                     count += 1
@@ -426,6 +445,9 @@ def train_one_task(
     # --- Profile and log final flamegraph ---
     example_batch = next(iter(val_loader))
     profile_and_log_flamegraph(
+        model, example_batch, cfg, logger, compute_loss=compute_loss
+    )
+    profile_and_log_flamegraph_backward(
         model, example_batch, cfg, logger, compute_loss=compute_loss
     )
     return {}
@@ -455,9 +477,8 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
     auc = roc_auc_score(y_true, y_pred)
     fpr, tpr, _ = roc_curve(y_true, y_pred)
 
-    # Per-task metrics and ROC curves
+    # Per-task metrics
     task_metrics = {}
-    roc_curves = {}
     for tid in np.unique(task_ids):
         mask = task_ids == tid
         y_true_tid = y_true[mask]
@@ -467,12 +488,8 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
         try:
             task_auc = roc_auc_score(y_true_tid, y_pred_tid)
             task_acc = accuracy_score(y_true_tid, (y_pred_tid > 0.5).astype(float))
-            task_metrics[f"task_{tid}"] = {"accuracy": task_acc, "auc": task_auc}
-
-            # Store ROC curve for this task
-            task_fpr, task_tpr, _ = roc_curve(y_true_tid, y_pred_tid)
-            roc_curves[f"task_{tid}"] = (task_fpr, task_tpr)
-        except Exception as e:
+            task_metrics[tid] = {"accuracy": task_acc, "auc": task_auc}
+        except Exception:
             continue
 
     # Generate classification report
@@ -480,87 +497,79 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
         y_true, (y_pred > 0.5).astype(float), output_dict=True
     )
 
-    # Save individual ROC curve
+    # --- Plotting ---
     assets_dir = cfg.assets_dir
     os.makedirs(assets_dir, exist_ok=True)
+    plot_suffix = f"{'all_tasks' if task_id is None else f'task_{task_id}'}"
+
+    # Save overall ROC curve
     plt.figure()
-    plt.plot(fpr, tpr, label=f"ROC curve (area = {auc:.2f})")
+    plt.plot(fpr, tpr, label=f"Overall ROC (area = {auc:.2f})")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title(f"ROC Curve - {'All Tasks' if task_id is None else f'Task {task_id}'}")
+    plt.title(f"Overall ROC Curve - {plot_suffix.replace('_', ' ').title()}")
     plt.legend(loc="lower right")
-    plot_path = os.path.join(
-        assets_dir,
-        f"roc_curve_{'all_tasks' if task_id is None else f'task_{task_id}'}.png",
-    )
-    plt.savefig(plot_path)
+    roc_plot_path = os.path.join(assets_dir, f"roc_curve_{plot_suffix}.png")
+    plt.savefig(roc_plot_path)
     plt.close()
 
-    # Save per-task accuracy bar plot
+    if cfg.wandb.log:
+        wandb.log(
+            {
+                f"test/roc_curve_{plot_suffix}": wandb.plot.line_series(
+                    xs=[fpr],
+                    ys=[tpr],
+                    keys=["ROC"],
+                    title=f"ROC Curve - {plot_suffix.replace('_', ' ').title()}",
+                    xname="FPR",
+                )
+            }
+        )
+
+    # Save per-task accuracy and AUC scatter plots
     if len(task_metrics) > 0:
-        plt.figure()
-        task_names = list(task_metrics.keys())
-        accuracies = [task_metrics[k]["accuracy"] for k in task_names]
-        plt.bar(task_names, accuracies)
+        task_ids_list = list(task_metrics.keys())
+        accuracies = [task_metrics[tid]["accuracy"] for tid in task_ids_list]
+        aucs = [task_metrics[tid]["auc"] for tid in task_ids_list]
+
+        # Accuracy Scatter Plot
+        plt.figure(figsize=(10, 6))
+        plt.scatter(task_ids_list, accuracies, alpha=0.6)
+        plt.xlabel("Task ID")
         plt.ylabel("Accuracy")
         plt.ylim(0, 1)
         plt.title(
-            f"Per-Task Test Accuracy - {'All Tasks' if task_id is None else f'Task {task_id}'}"
+            f"Per-Task Test Accuracy Scatter Plot - {plot_suffix.replace('_', ' ').title()}"
         )
-        plt.xticks(rotation=45)
-        bar_path = os.path.join(
-            assets_dir,
-            f"accuracy_bar_{'all_tasks' if task_id is None else f'task_{task_id}'}.png",
+        plt.grid(True)
+        acc_scatter_path = os.path.join(
+            assets_dir, f"accuracy_scatter_{plot_suffix}.png"
         )
         plt.tight_layout()
-        plt.savefig(bar_path)
+        plt.savefig(acc_scatter_path)
         plt.close()
-        # Log to wandb if enabled
-        if cfg.wandb.log:
-            bar_key = f"test/accuracy_bar_{'all_tasks' if task_id is None else f'task_{task_id}'}"
-            wandb.log({bar_key: wandb.Image(bar_path)})
 
-    # Save overlay ROC curve for all tasks
-    if len(roc_curves) > 0:
-        plt.figure()
-        for k, (task_fpr, task_tpr) in roc_curves.items():
-            plt.plot(task_fpr, task_tpr, label=k)
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve Overlay (All Tasks)")
-        plt.legend(loc="lower right")
-        overlay_path = os.path.join(assets_dir, "roc_curve_overlay.png")
-        plt.savefig(overlay_path)
+        # AUC Scatter Plot
+        plt.figure(figsize=(10, 6))
+        plt.scatter(task_ids_list, aucs, alpha=0.6)
+        plt.xlabel("Task ID")
+        plt.ylabel("AUC")
+        plt.ylim(0, 1)
+        plt.title(
+            f"Per-Task Test AUC Scatter Plot - {plot_suffix.replace('_', ' ').title()}"
+        )
+        plt.grid(True)
+        auc_scatter_path = os.path.join(assets_dir, f"auc_scatter_{plot_suffix}.png")
+        plt.tight_layout()
+        plt.savefig(auc_scatter_path)
+        plt.close()
 
-        # Log to wandb if enabled
         if cfg.wandb.log:
-            # Log individual ROC curve
             wandb.log(
-                {
-                    f"test/roc_curve_{'all_tasks' if task_id is None else f'task_{task_id}'}": wandb.plot.line_series(
-                        xs=[fpr],
-                        ys=[tpr],
-                        keys=["ROC"],
-                        title=f"ROC Curve - {'All Tasks' if task_id is None else f'Task {task_id}'}",
-                        xname="FPR",
-                    )
-                }
+                {f"test/accuracy_scatter_{plot_suffix}": wandb.Image(acc_scatter_path)}
             )
-
-            # Log overlay ROC curve
-            xs = [roc_curves[k][0] for k in roc_curves]
-            ys = [roc_curves[k][1] for k in roc_curves]
-            keys = list(roc_curves.keys())
             wandb.log(
-                {
-                    "test/roc_curve_overlay": wandb.plot.line_series(
-                        xs=xs,
-                        ys=ys,
-                        keys=keys,
-                        title="ROC Curve Overlay (All Tasks)",
-                        xname="FPR",
-                    )
-                }
+                {f"test/auc_scatter_{plot_suffix}": wandb.Image(auc_scatter_path)}
             )
 
     return {
@@ -572,10 +581,8 @@ def evaluate_model(cfg: DictConfig, model, test_loader, task_id: int | None = No
 def train_sequential(cfg: DictConfig):
     """Train a classifier for each task sequentially."""
     # Init on device
-    if torch.cuda.is_available():
-        device = get_ordinal_device(cfg.device)
-        torch.cuda.set_device(device)
-    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)
+    device = _resolve_device(cfg.device)
+    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)  # type: ignore
     train_loader, val_loader, test_loader = make_dataloaders(cfg)
 
     logger = LoggerAggregator(cfg)
@@ -597,13 +604,9 @@ def train_sequential(cfg: DictConfig):
 def train_mixed_batch(cfg: DictConfig):
     """Train a library of classifers for all tasks in a single batch, step-based."""
     # Init on device
-    if torch.cuda.is_available():
-        device = get_ordinal_device(cfg.device)
-        torch.cuda.set_device(device)
+    device = _resolve_device(cfg.device)
 
-    breakpoint()
-
-    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)
+    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)  # type: ignore
     train_loader, val_loader, test_loader = make_dataloaders(cfg)
     logger = LoggerAggregator(cfg)
     opt = make_opt(model, cfg)
@@ -718,13 +721,26 @@ def train_mixed_batch(cfg: DictConfig):
     print("\nClassification Report:")
     print(metrics["overall"]["classification_report"])
     print("\nPer-task metrics:")
-    for task_id, task_metrics in metrics["per_task"].items():
-        print(f"\n{task_id}:")
-        print(f"Accuracy: {task_metrics['accuracy']:.4f}")
-        print(f"AUC: {task_metrics['auc']:.4f}")
+    # Print a summary instead of all tasks if there are many
+    if len(metrics["per_task"]) > 10:
+        print("(Showing first 10 tasks out of", len(metrics["per_task"]), ")")
+        for i, (task_id, task_metrics) in enumerate(metrics["per_task"].items()):
+            if i >= 10:
+                break
+            print(f"\nTask {task_id}:")
+            print(f"  Accuracy: {task_metrics['accuracy']:.4f}")
+            print(f"  AUC: {task_metrics['auc']:.4f}")
+    else:
+        for task_id, task_metrics in metrics["per_task"].items():
+            print(f"\nTask {task_id}:")
+            print(f"  Accuracy: {task_metrics['accuracy']:.4f}")
+            print(f"  AUC: {task_metrics['auc']:.4f}")
     # --- Profile and log final flamegraph ---
     example_batch = next(iter(test_loader))
     profile_and_log_flamegraph(
+        model, example_batch, cfg, logger, compute_loss=compute_loss
+    )
+    profile_and_log_flamegraph_backward(
         model, example_batch, cfg, logger, compute_loss=compute_loss
     )
 

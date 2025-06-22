@@ -1,5 +1,6 @@
-"""original credit to: https://gist.github.com/joschu/f503500cda64f2ce87c8288906b09e2d#file-reptile-sinewaves-demo-py"""
+"""Original script from: https://gist.github.com/joschu/f503500cda64f2ce87c8288906b09e2d#file-reptile-sinewaves-demo-py"""
 
+import os
 from copy import deepcopy
 
 import matplotlib.pyplot as plt
@@ -17,6 +18,13 @@ niterations = (
     30000  # number of outer updates; each iteration we sample one task and update on it
 )
 
+# Create assets directory for saving plots
+os.makedirs("assets/reptile_history", exist_ok=True)
+
+# Check for CUDA availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 rng = np.random.RandomState(seed)
 torch.manual_seed(seed)
 
@@ -29,7 +37,10 @@ def gen_task():
     "Generate classification problem"
     phase = rng.uniform(low=0, high=2 * np.pi)
     ampl = rng.uniform(0.1, 5)
-    f_randomsine = lambda x: np.sin(x + phase) * ampl
+
+    def f_randomsine(x):
+        return np.sin(x + phase) * ampl
+
     return f_randomsine
 
 
@@ -40,11 +51,11 @@ model = nn.Sequential(
     nn.Linear(64, 64),
     nn.Tanh(),
     nn.Linear(64, 1),
-)
+).to(device)  # Move model to GPU
 
 
 def totorch(x):
-    return ag.Variable(torch.Tensor(x))
+    return ag.Variable(torch.Tensor(x).to(device))  # Move tensor to GPU
 
 
 def train_on_batch(x, y):
@@ -55,12 +66,13 @@ def train_on_batch(x, y):
     loss = (ypred - y).pow(2).mean()
     loss.backward()
     for param in model.parameters():
-        param.data -= innerstepsize * param.grad.data
+        if param.grad is not None:
+            param.data -= innerstepsize * param.grad.data
 
 
 def predict(x):
     x = totorch(x)
-    return model(x).data.numpy()
+    return model(x).cpu().data.numpy()  # Move result back to CPU for numpy conversion
 
 
 # Choose a fixed task and minibatch for visualization
@@ -93,7 +105,7 @@ for iteration in range(niterations):
 
     # Periodically plot the results on a particular task and minibatch
     if plot and iteration == 0 or (iteration + 1) % 1000 == 0:
-        plt.cla()
+        plt.figure(figsize=(10, 6))
         f = f_plot
         weights_before = deepcopy(model.state_dict())  # save snapshot before evaluation
         plt.plot(x_all, predict(x_all), label="pred after 0", color=(0, 0, 1))
@@ -112,10 +124,17 @@ for iteration in range(niterations):
         plt.plot(xtrain_plot, f(xtrain_plot), "x", label="train", color="k")
         plt.ylim(-4, 4)
         plt.legend(loc="lower right")
-        plt.pause(0.01)
+        plt.title(f"Reptile Training - Iteration {iteration + 1}")
+        plt.xlabel("x")
+        plt.ylabel("y")
+
+        # Save the plot as PNG
+        filename = f"assets/reptile_history/iteration_{iteration + 1:06d}.png"
+        plt.savefig(filename, dpi=150, bbox_inches="tight")
+        plt.close()  # Close the figure to free memory
+
         model.load_state_dict(weights_before)  # restore from snapshot
-        print(f"-----------------------------")
+        print("-----------------------------")
         print(f"iteration               {iteration + 1}")
-        print(
-            f"loss on plotted curve   {lossval:.3f}"
-        )  # would be better to average loss over a set of examples, but this is optimized for brevity
+        print(f"loss on plotted curve   {lossval:.3f}")
+        print(f"plot saved to           {filename}")

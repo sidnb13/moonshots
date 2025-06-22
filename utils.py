@@ -6,9 +6,8 @@ import time
 import numpy as np
 import torch
 import torch.profiler
-from omegaconf import OmegaConf
-
 import wandb
+from omegaconf import OmegaConf
 
 
 def set_seed(seed: int):
@@ -48,6 +47,53 @@ def get_ordinal_device(device_str: str):
             return None
     # Could add support for other accelerators here
     return None
+
+
+def _resolve_device(device_str: str):
+    """
+    Resolves device string to torch.device and sets the device if needed.
+    Handles CPU, CUDA, and MPS devices.
+
+    Args:
+        device_str: Device string like 'cpu', 'cuda', 'cuda:0', 'mps'
+
+    Returns:
+        torch.device: The resolved device
+    """
+    if device_str == "cpu":
+        return torch.device("cpu")
+
+    elif device_str.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print("CUDA requested but not available, falling back to CPU")
+            return torch.device("cpu")
+
+        # Handle CUDA device specification
+        if device_str == "cuda":
+            # Use current CUDA device or default to 0
+            device_ordinal = torch.cuda.current_device()
+        else:
+            # Parse device ordinal from string like 'cuda:0'
+            parts = device_str.split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                device_ordinal = int(parts[1])
+            else:
+                print(f"Invalid CUDA device string: {device_str}, using device 0")
+                device_ordinal = 0
+
+        # Set the device and return
+        torch.cuda.set_device(device_ordinal)
+        return torch.device(f"cuda:{device_ordinal}")
+
+    elif device_str == "mps":
+        if not torch.backends.mps.is_available():
+            print("MPS requested but not available, falling back to CPU")
+            return torch.device("cpu")
+        return torch.device("mps")
+
+    else:
+        print(f"Unknown device string: {device_str}, falling back to CPU")
+        return torch.device("cpu")
 
 
 class LoggerAggregator:
@@ -239,9 +285,9 @@ def profile_and_log_flamegraph(model, example_batch, cfg, logger, compute_loss=N
         with torch.no_grad():
             y_pred = model(x.to(cfg.device), task_id.to(cfg.device))
             if compute_loss is not None:
-                loss = compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
+                compute_loss(y_pred, y.to(cfg.device), task_id.to(cfg.device))
             else:
-                loss = y_pred  # fallback
+                pass  # fallback
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     prof.export_chrome_trace(trace_path)
@@ -252,3 +298,46 @@ def profile_and_log_flamegraph(model, example_batch, cfg, logger, compute_loss=N
         artifact.add_file(trace_path)
         wandb.log_artifact(artifact)
         print("[WANDB] Final flamegraph trace logged as artifact.")
+
+
+def profile_and_log_flamegraph_backward(
+    model, example_batch, cfg, logger, compute_loss=None
+):
+    """
+    Profiles a single backward step, saves a Chrome trace, and logs as a wandb artifact if enabled.
+    example_batch: (x, y, task_id) tuple
+    compute_loss: function to compute loss (if not provided, expects model to return loss)
+    """
+    profiler_dir = getattr(cfg, "profiler_dir", "profiler_traces")
+    os.makedirs(profiler_dir, exist_ok=True)
+    trace_path = os.path.join(profiler_dir, "final_flamegraph_backward.json")
+    model.train()
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.zero_()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+        + ([torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else []),
+        record_shapes=True,
+        with_stack=True,
+    ) as prof:
+        x, y, task_id = example_batch
+        x = x.to(cfg.device)
+        y = y.to(cfg.device)
+        task_id = task_id.to(cfg.device)
+        y_pred = model(x, task_id)
+        if compute_loss is not None:
+            loss = compute_loss(y_pred, y, task_id)
+        else:
+            loss = y_pred  # fallback
+        loss.backward()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    prof.export_chrome_trace(trace_path)
+    print(f"[PROFILER] Final backward flamegraph trace written to {trace_path}")
+    # Log as wandb artifact if enabled
+    if hasattr(cfg, "wandb") and getattr(cfg.wandb, "log", False):
+        artifact = wandb.Artifact("final_flamegraph_backward", type="profile")
+        artifact.add_file(trace_path)
+        wandb.log_artifact(artifact)
+        print("[WANDB] Final backward flamegraph trace logged as artifact.")
