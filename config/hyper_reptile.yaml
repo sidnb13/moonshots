@@ -2,10 +2,9 @@ seed: 0
 plot: true
 
 # Meta-learning parameters
-innerstepsize: 0.02  # stepsize in inner SGD
-innerepochs: 1  # number of epochs of each inner SGD
-outerstepsize0: 0.1  # stepsize of outer optimization, i.e., meta-optimization
-niterations: 30000  # number of outer updates; each iteration we sample one task and update on it
+inner_stepsize: 0.02  # stepsize in inner SGD
+outerstepsize: 0.1  # stepsize of outer optimization, i.e., meta-optimization
+outer_steps: 30000  # number of outer updates; each iteration we sample one task and update on it
 
 # Task generation parameters
 x_min: -5
@@ -33,4 +32,7 @@ wandb:
 
 # Output
 assets_dir: assets
+save_plots: true
 plot_interval: 1000  # Plot every N iterations
+inner_plot_steps: 32
+plot_inner_interval: 8

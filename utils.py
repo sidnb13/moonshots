@@ -6,8 +6,9 @@ import time
 import numpy as np
 import torch
 import torch.profiler
-import wandb
 from omegaconf import OmegaConf
+
+import wandb
 
 
 def set_seed(seed: int):
@@ -129,7 +130,9 @@ class LoggerAggregator:
         if self.cfg.wandb.log:
             if section is not None:
                 log_dict = {f"{section}/{k}": v for k, v in log_dict.items()}
-            wandb.log(log_dict)
+                log_dict.update({"counters/step": step})
+
+            wandb.log(log_dict, step=step)
 
 
 @contextlib.contextmanager

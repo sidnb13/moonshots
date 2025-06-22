@@ -9,11 +9,70 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 from omegaconf import DictConfig
 from tqdm import tqdm
 
+import wandb
 from utils import LoggerAggregator, _resolve_device, set_seed
+
+
+def plot_results(
+    model: nn.Module,
+    x_all: np.ndarray,
+    f_plot: Callable,
+    xtrain_plot: np.ndarray,
+    iteration: int,
+    cfg: DictConfig,
+    logger: LoggerAggregator,
+    device: torch.device,
+):
+    """Plot and log the current results (always on CPU in background)."""
+    plt.cla()
+    weights_before = deepcopy(model.state_dict())
+    plt.plot(
+        x_all, predict(model, x_all, device), label="pred after 0", color=(0, 0, 1)
+    )
+    for inneriter in range(cfg.inner_plot_steps):
+        train_on_batch(
+            model, xtrain_plot, f_plot(xtrain_plot), cfg.inner_stepsize, device
+        )
+        if (inneriter + 1) % cfg.plot_inner_interval == 0:
+            frac = (inneriter + 1) / cfg.inner_plot_steps
+            plt.plot(
+                x_all,
+                predict(model, x_all, device),
+                label="pred after %i" % (inneriter + 1),
+                color=(frac, 0, 1 - frac),
+            )
+    plt.plot(x_all, f_plot(x_all), label="true", color=(0, 1, 0))
+    plt.plot(xtrain_plot, f_plot(xtrain_plot), "x", label="train", color="k")
+    lossval = np.square(predict(model, x_all, device) - f_plot(x_all)).mean()
+    plt.ylim(-4, 4)
+    plt.legend(loc="lower right")
+    plt.title(f"Reptile Training - Iteration {iteration + 1}")
+    if hasattr(cfg, "assets_dir") and cfg.assets_dir:
+        os.makedirs(cfg.assets_dir, exist_ok=True)
+        plot_path = os.path.join(
+            cfg.assets_dir, f"reptile_iteration_{iteration + 1}.png"
+        )
+        plt.savefig(plot_path)
+        if cfg.wandb.log:
+            logger.log_dict(
+                {"plot": wandb.Image(plot_path)},
+                section="visualization",
+                kind="image",
+                step=iteration,
+            )
+
+    model.load_state_dict(weights_before)
+    logger.log_dict(
+        {
+            "loss_on_plotted_curve": lossval,
+        },
+        section="training",
+        kind="scalar",
+        step=iteration,
+    )
 
 
 def make_model(cfg: DictConfig) -> nn.Module:
@@ -46,17 +105,20 @@ def gen_task(cfg: DictConfig, rng: np.random.RandomState) -> Callable:
     return f_randomsine
 
 
-def totorch(x: np.ndarray) -> torch.Tensor:
-    """Convert numpy array to torch tensor with gradient tracking."""
-    return torch.tensor(x, dtype=torch.float32, requires_grad=True)
+def totorch(x: np.ndarray, device: torch.device) -> torch.Tensor:
+    return torch.tensor(x, dtype=torch.float32, device=device)
 
 
 def train_on_batch(
-    model: nn.Module, x: np.ndarray, y: np.ndarray, innerstepsize: float
+    model: nn.Module,
+    x: np.ndarray,
+    y: np.ndarray,
+    inner_stepsize: float,
+    device: torch.device,
 ):
     """Train the model on a single batch using inner loop SGD."""
-    x_tensor = totorch(x)
-    y_tensor = totorch(y)
+    x_tensor = totorch(x, device)
+    y_tensor = totorch(y, device)
 
     model.zero_grad()
     ypred = model(x_tensor)
@@ -66,88 +128,14 @@ def train_on_batch(
     # Manual SGD update
     for param in model.parameters():
         if param.grad is not None:
-            param.data -= innerstepsize * param.grad.data
+            param.data -= inner_stepsize * param.grad.data
 
 
-def predict(model: nn.Module, x: np.ndarray) -> np.ndarray:
+def predict(model: nn.Module, x: np.ndarray, device: torch.device) -> np.ndarray:
     """Make predictions using the model."""
-    x_tensor = totorch(x)
+    x_tensor = totorch(x, device)
     with torch.no_grad():
-        return model(x_tensor).detach().numpy()
-
-
-def plot_results(
-    model: nn.Module,
-    x_all: np.ndarray,
-    f_plot: Callable,
-    xtrain_plot: np.ndarray,
-    iteration: int,
-    cfg: DictConfig,
-    logger: LoggerAggregator,
-):
-    """Plot and log the current results."""
-    plt.cla()
-    weights_before = deepcopy(model.state_dict())  # save snapshot before evaluation
-
-    # Plot predictions after 0 inner steps
-    plt.plot(x_all, predict(model, x_all), label="pred after 0", color=(0, 0, 1))
-
-    # Plot predictions after various numbers of inner steps
-    for inneriter in range(32):
-        train_on_batch(model, xtrain_plot, f_plot(xtrain_plot), cfg.innerstepsize)
-        if (inneriter + 1) % 8 == 0:
-            frac = (inneriter + 1) / 32
-            plt.plot(
-                x_all,
-                predict(model, x_all),
-                label="pred after %i" % (inneriter + 1),
-                color=(frac, 0, 1 - frac),
-            )
-
-    # Plot true function and training points
-    plt.plot(x_all, f_plot(x_all), label="true", color=(0, 1, 0))
-    plt.plot(xtrain_plot, f_plot(xtrain_plot), "x", label="train", color="k")
-
-    # Calculate and log loss
-    lossval = np.square(predict(model, x_all) - f_plot(x_all)).mean()
-
-    plt.ylim(-4, 4)
-    plt.legend(loc="lower right")
-    plt.title(f"Reptile Training - Iteration {iteration + 1}")
-
-    # Save plot if assets directory is specified
-    if hasattr(cfg, "assets_dir") and cfg.assets_dir:
-        os.makedirs(cfg.assets_dir, exist_ok=True)
-        plot_path = os.path.join(
-            cfg.assets_dir, f"reptile_iteration_{iteration + 1}.png"
-        )
-        plt.savefig(plot_path)
-
-        # Log to wandb if enabled
-        if cfg.wandb.log:
-            logger.log_dict(
-                {"plot": wandb.Image(plot_path)},
-                section="visualization",
-                kind="image",
-                step=iteration,
-            )
-
-    plt.pause(0.01)
-    model.load_state_dict(weights_before)  # restore from snapshot
-
-    # Log metrics
-    logger.log_dict(
-        {
-            "loss_on_plotted_curve": lossval,
-        },
-        section="training",
-        kind="scalar",
-        step=iteration,
-    )
-
-    print("-----------------------------")
-    print(f"iteration               {iteration + 1}")
-    print(f"loss on plotted curve   {lossval:.3f}")
+        return model(x_tensor).cpu().numpy()
 
 
 def meta_train_loop(
@@ -158,32 +146,26 @@ def meta_train_loop(
     xtrain_plot: np.ndarray,
     rng: np.random.RandomState,
     logger: LoggerAggregator,
+    device: torch.device,
 ):
-    """Main meta-learning training loop for Reptile."""
-    print(f"Starting Reptile training for {cfg.niterations} iterations...")
-
-    for iteration in tqdm(range(cfg.niterations), desc="Meta-training"):
-        # Save weights before inner loop
+    print(f"Starting Reptile training for {cfg.outer_steps} iterations...")
+    pbar = tqdm(range(cfg.outer_steps), desc="Meta-training")
+    for iteration in pbar:
         weights_before = deepcopy(model.state_dict())
-
-        # Generate a new task
         f = gen_task(cfg, rng)
         y_all = f(x_all)
-
-        # Inner loop: do SGD on this task
         inds = rng.permutation(len(x_all))
-        for _ in range(cfg.innerepochs):
-            for start in range(0, len(x_all), cfg.ntrain):
-                mbinds = inds[start : start + cfg.ntrain]
-                train_on_batch(model, x_all[mbinds], y_all[mbinds], cfg.innerstepsize)
-
-        # Outer loop: interpolate between current weights and trained weights
+        for start in range(0, len(x_all), cfg.ntrain):
+            mbinds = inds[start : start + cfg.ntrain]
+            train_on_batch(
+                model, x_all[mbinds], y_all[mbinds], cfg.inner_stepsize, device
+            )
         weights_after = model.state_dict()
-        outerstepsize = cfg.outerstepsize0 * (
-            1 - iteration / cfg.niterations
-        )  # linear schedule
 
-        # Reptile update: move towards the trained weights
+        y_pred = predict(model, x_all, device)
+        lossval = np.square(y_pred - f(x_all)).mean()
+
+        outerstepsize = cfg.outerstepsize * (1 - iteration / cfg.outer_steps)
         model.load_state_dict(
             {
                 name: weights_before[name]
@@ -192,9 +174,26 @@ def meta_train_loop(
             }
         )
 
-        # Periodically plot and log results
+        pbar.set_postfix({"loss": f"{lossval:.4f}"})
+
+        logger.log_dict(
+            {"inner_loop_loss": lossval},
+            section="training",
+            kind="scalar",
+            step=iteration,
+        )
+
         if cfg.plot and (iteration == 0 or (iteration + 1) % cfg.plot_interval == 0):
-            plot_results(model, x_all, f_plot, xtrain_plot, iteration, cfg, logger)
+            plot_results(
+                model,
+                x_all,
+                f_plot,
+                xtrain_plot,
+                iteration,
+                cfg,
+                logger,
+                device,
+            )
 
 
 @hydra.main(config_path="config", config_name="hyper_reptile", version_base=None)
@@ -224,7 +223,7 @@ def main(cfg: DictConfig):
     xtrain_plot = x_all[rng.choice(len(x_all), size=cfg.ntrain)]
 
     # Run meta-learning training
-    meta_train_loop(model, cfg, x_all, f_plot, xtrain_plot, rng, logger)
+    meta_train_loop(model, cfg, x_all, f_plot, xtrain_plot, rng, logger, device)
 
 
 if __name__ == "__main__":
