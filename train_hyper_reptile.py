@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from tqdm import tqdm
 
@@ -157,65 +158,93 @@ class Regressor(nn.Module):
         return self.net(x)
 
 
+class LowRankLinear(nn.Module):
+    """Use spectral initialization as recommended in: https://www.arxiv.org/pdf/2105.01029v2"""
+
+    def __init__(self, in_dim, out_dim, rank=8):
+        super().__init__()
+        self.rank = rank
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        with torch.no_grad():
+            W_target = nn.Parameter(torch.randn(in_dim, out_dim), requires_grad=False)
+            nn.init.xavier_uniform_(W_target)
+            U, S, V = torch.svd(W_target)
+            del W_target
+
+        self.A = nn.Parameter(U[:, :rank] * S[:rank].sqrt())  # [in_dim, rank]
+        self.B = nn.Parameter(V[:, :rank] * S[:rank].sqrt())  # [rank, out_dim]
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+
+    @property
+    def in_features(self):
+        return self.in_dim
+
+    @property
+    def out_features(self):
+        return self.out_dim
+
+    def forward(self, x):
+        return F.linear(x @ self.A, self.B, self.bias)
+
+
+class TinyMLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            LowRankLinear(in_dim, hidden_dim, rank=8),
+            nn.GELU(),
+            LowRankLinear(hidden_dim, out_dim, rank=8),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class HyperNetwork(nn.Module):
-    """Fast weight programmer."""
+    """Fast weight programmer with a shared generator head."""
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
-        H = cfg.hidden_dim
-        D = cfg.hyper_input_dim * (2 if cfg.input_cond else 1)
-
-        # embeddings + optional input conditioning
+        self.hdim = cfg.hidden_dim
+        self.layer_shapes = [
+            (cfg.hidden_dim, 1),  # Layer 1: (out, in)
+            (cfg.hidden_dim, cfg.hidden_dim),  # Layer 2
+            (1, cfg.hidden_dim),  # Layer 3
+        ]
+        self.bias_shapes = [
+            (cfg.hidden_dim,),
+            (cfg.hidden_dim,),
+            (1,),
+        ]
+        self.n_layers = len(self.layer_shapes)
         self.task_emb = nn.Embedding(cfg.num_tasks, cfg.hyper_input_dim)
-        if cfg.input_cond:
-            self.x_emb = nn.Linear(1, cfg.hyper_input_dim)
-
-        # meta-parameters:
-        self.lin1 = nn.Linear(D, 2 * H)  # [w1_vec (H), b1 (H)]
-        self.lin2 = nn.Linear(D, H * H)  # [w2_vec (H×H)]
-        self.lin3 = nn.Linear(D, H)  # [w3_vec (1×H) flattened as H]
-        self.lin4 = nn.Linear(D, H + 1)  # [b2 (H), b3 (1)]
+        self.layer_emb = nn.Embedding(self.n_layers, cfg.hyper_input_dim)
+        self.gen_out_dim = max(
+            np.prod(w) + np.prod(b) for w, b in zip(self.layer_shapes, self.bias_shapes)
+        )
+        self.gen = TinyMLP(
+            cfg.hyper_input_dim * 2, self.gen_out_dim, cfg.intermediate_dim
+        )
 
     def forward(self, task_id: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        H = self.lin3.out_features  # hidden dim
-
-        # Accept task_id as scalar or [1]
-        if task_id.dim() == 0:
-            task_id = task_id.unsqueeze(0)
-        assert task_id.shape[0] == 1, (
-            "task_id should be a scalar or shape [1] for one-task-per-batch mode"
-        )
-        B = x.shape[0]
-
-        # build conditioning vector for the task
-        z = self.task_emb(task_id)  # [1, D]
-        if hasattr(self, "x_emb"):
-            z = torch.cat([z.expand(B, -1), self.x_emb(x)], dim=-1)  # [B, D]
-        else:
-            z = z.expand(B, -1)  # [B, D]
-
-        # -- layer 1 params --
-        v1 = self.lin1(z)  # [B, 2H]
-        w1 = v1[:, :H].view(-1, H, 1)  # [B, H, 1]
-        b1 = v1[:, H:]  # [B, H]
-
-        # -- layer 2 params --
-        w2 = self.lin2(z).view(-1, H, H)  # [B, H, H]
-
-        # -- layer 3 weight --
-        w3 = self.lin3(z).view(-1, 1, H)  # [B, 1, H]
-
-        # -- biases for layer 2 & 3 --
-        v4 = self.lin4(z)  # [B, H+1]
-        b2 = v4[:, :H]  # [B, H]
-        b3 = v4[:, H:]  # [B, 1]
-
-        # -- forward pass --
-        h1 = torch.tanh(torch.bmm(w1, x.unsqueeze(-1)).squeeze(-1) + b1)
-        h2 = torch.tanh(torch.bmm(w2, h1.unsqueeze(-1)).squeeze(-1) + b2)
-        out = torch.bmm(w3, h2.unsqueeze(-1)).squeeze(-1) + b3
-
-        return out.squeeze(-1)
+        code = self.task_emb(task_id)  # [1, D]
+        out = x
+        for idx, (w_shape, b_shape) in enumerate(
+            zip(self.layer_shapes, self.bias_shapes)
+        ):
+            emb = self.layer_emb(torch.tensor(idx, device=task_id.device))  # [D]
+            inp = torch.cat([code.squeeze(0), emb], dim=-1)  # [2D]
+            params = self.gen(inp)  # [gen_out_dim]
+            w_num = np.prod(w_shape)
+            b_num = np.prod(b_shape)
+            wl = params[:w_num].view(*w_shape)
+            bl = params[w_num : w_num + b_num].view(*b_shape)
+            out = F.linear(out, wl, bl)
+            if idx < self.n_layers - 1:
+                out = torch.tanh(out)
+        return out
 
 
 def gen_task(rng: np.random.RandomState) -> Callable:
@@ -284,13 +313,22 @@ def hypernet_train_loop(
     device: torch.device,
 ):
     print(f"Starting Hypernet training for {cfg.outer_steps} iterations...")
-    pbar = tqdm(range(cfg.outer_steps), desc="Hypernet-training")
-    opt = torch.optim.Adam(hypernet.parameters(), lr=cfg.hypernet_lr)
+    pbar = tqdm(
+        range(cfg.outer_steps),
+        desc="Hypernet-training",
+        disable=not cfg.pbar_interval,
+    )
+    opt = torch.optim.AdamW(
+        hypernet.parameters(),
+        lr=cfg.hypernet_lr,
+        weight_decay=cfg.hypernet_weight_decay,
+    )
     for iteration in pbar:
+        # sample task and input data
         task_id = rng.randint(0, cfg.num_tasks)
         f = gen_task_from_id(task_id)
         y_all = f(x_all)
-        inds = rng.permutation(len(x_all))
+        inds = rng.permutation(len(x_all))[: cfg.ntrain]
         x_mb = totorch(x_all[inds], device)
         y_mb = totorch(y_all[inds], device)
         task_id_tensor = torch.tensor([task_id], dtype=torch.long, device=device)
@@ -299,51 +337,57 @@ def hypernet_train_loop(
 
         opt.zero_grad()
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(hypernet.parameters(), max_norm=1.0)
         opt.step()
 
-        pbar.set_postfix({"loss": f"{loss:.4f}"})
+        if (iteration + 1) % cfg.pbar_interval == 0:
+            pbar.set_postfix({"loss": f"{loss:.4f}", "grad_norm": f"{grad_norm:.4f}"})
+
         logger.log_dict(
-            {"hypernet_loss": loss},
+            {"hypernet_loss": loss, "grad_norm": grad_norm},
             section="training",
             kind="scalar",
             step=iteration,
         )
 
         # Validation
-        if (iteration + 1) % cfg.val_interval == 0:
-            val_task_id = rng.randint(0, cfg.num_tasks)
-            f_val = gen_task_from_id(val_task_id)
-            y_val = f_val(x_all)
-            inds_val = rng.permutation(len(x_all))
-            mbinds = inds_val[: cfg.ntrain]
-            x_mb_val = totorch(x_all[mbinds], device)
-            y_mb_val = totorch(y_val[mbinds], device)
-            val_task_id_tensor = torch.tensor(
-                [val_task_id], dtype=torch.long, device=device
-            )
-            pred_val = hypernet(val_task_id_tensor, x_mb_val)
+        with torch.no_grad():
+            if (iteration + 1) % cfg.val_interval == 0:
+                val_task_id = rng.randint(0, cfg.num_tasks)
+                f_val = gen_task_from_id(val_task_id)
+                y_val = f_val(x_all)
+                inds_val = rng.permutation(len(x_all))
+                mbinds = inds_val[: cfg.ntrain]
+                x_mb_val = totorch(x_all[mbinds], device)
+                y_mb_val = totorch(y_val[mbinds], device)
+                val_task_id_tensor = torch.tensor(
+                    [val_task_id], dtype=torch.long, device=device
+                )
+                pred_val = hypernet(val_task_id_tensor, x_mb_val)
 
-            loss_val = (pred_val - y_mb_val).pow(2).mean()
-            pbar.set_postfix({"loss": f"{loss_val:.4f}"})
-            logger.log_dict(
-                {"hypernet_loss": loss_val},
-                section="validation",
-                kind="scalar",
-                step=iteration,
-            )
+                loss_val = (pred_val - y_mb_val).pow(2).mean()
+                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
+                logger.log_dict(
+                    {"hypernet_loss": loss_val},
+                    section="validation",
+                    kind="scalar",
+                    step=iteration,
+                )
 
-        # Plotting for hypernet
-        if cfg.plot and (iteration == 0 or (iteration + 1) % cfg.plot_interval == 0):
-            plot_results_hypernet(
-                hypernet,
-                x_all,
-                f_plot,
-                xtrain_plot,
-                iteration,
-                cfg,
-                logger,
-                device,
-            )
+            # Plotting for hypernet
+            if cfg.plot and (
+                iteration == 0 or (iteration + 1) % cfg.plot_interval == 0
+            ):
+                plot_results_hypernet(
+                    hypernet,
+                    x_all,
+                    f_plot,
+                    xtrain_plot,
+                    iteration,
+                    cfg,
+                    logger,
+                    device,
+                )
 
 
 def meta_train_loop(
@@ -357,7 +401,11 @@ def meta_train_loop(
     device: torch.device,
 ):
     print(f"Starting Reptile training for {cfg.outer_steps} iterations...")
-    pbar = tqdm(range(cfg.outer_steps), desc="Meta-training")
+    pbar = tqdm(
+        range(cfg.outer_steps),
+        desc="Meta-training",
+        disable=not cfg.pbar_interval,
+    )
     for iteration in pbar:
         weights_before = deepcopy(model.state_dict())
         f = gen_task(rng)
@@ -382,7 +430,8 @@ def meta_train_loop(
             }
         )
 
-        pbar.set_postfix({"loss": f"{lossval:.4f}"})
+        if (iteration + 1) % cfg.pbar_interval == 0:
+            pbar.set_postfix({"loss": f"{lossval:.4f}"})
 
         logger.log_dict(
             {"inner_loop_loss": lossval},

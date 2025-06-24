@@ -18,7 +18,7 @@ dependencies = [
     "python-dotenv",
     "matplotlib",
     "scikit-learn",
-    "tqdm"
+    "tqdm",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +30,12 @@ dev = [
 ]
 ray = [
     "hydra-ray-jobs-launcher @ git+https://github.com/sidnb13/hydra#egg=hydra-ray-jobs-launcher&subdirectory=plugins/hydra_ray_jobs_launcher",
+]
+safetrain = [
+    "datasets",
+    "fasttext",
+    "kaggle",
+    "transformers",
 ]
 
 [build-system]

@@ -4,6 +4,8 @@ wandb/
 assets/
 profiler_traces/
 
+scripts/kaggle.json
+
 .DS_Store
 
 # Byte-compiled / optimized / DLL files
