@@ -5,6 +5,7 @@ from collections.abc import Callable
 from copy import deepcopy
 
 import hydra
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -15,6 +16,8 @@ from tqdm import tqdm
 
 import wandb
 from utils import LoggerAggregator, _resolve_device, set_seed
+
+matplotlib.use("Agg")
 
 
 def plot_results_hypernet(
@@ -190,12 +193,12 @@ class LowRankLinear(nn.Module):
 
 
 class TinyMLP(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim):
+    def __init__(self, in_dim, out_dim, hidden_dim, rank=8):
         super().__init__()
         self.net = nn.Sequential(
-            LowRankLinear(in_dim, hidden_dim, rank=8),
+            LowRankLinear(in_dim, hidden_dim, rank=rank),
             nn.GELU(),
-            LowRankLinear(hidden_dim, out_dim, rank=8),
+            LowRankLinear(hidden_dim, out_dim, rank=rank),
         )
 
     def forward(self, x):
@@ -225,7 +228,10 @@ class HyperNetwork(nn.Module):
             np.prod(w) + np.prod(b) for w, b in zip(self.layer_shapes, self.bias_shapes)
         )
         self.gen = TinyMLP(
-            cfg.hyper_input_dim * 2, self.gen_out_dim, cfg.intermediate_dim
+            cfg.hyper_input_dim * 2,
+            self.gen_out_dim,
+            cfg.intermediate_dim,
+            rank=cfg.rank,
         )
 
     def forward(self, task_id: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

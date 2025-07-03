@@ -19,6 +19,8 @@ intermediate_dim: 128
 hyper_input_dim: 128
 hypernet_lr: 1e-4  # Learning rate for hypernetwork optimizer
 hypernet_weight_decay: 0.0  # Weight decay for hypernetwork optimizer
+# for low rank MLP in hypernet
+rank: 8
 
 # Device
 device: cpu
