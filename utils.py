@@ -11,6 +11,14 @@ from omegaconf import OmegaConf
 import wandb
 
 
+def get_total_gradient_bytes(model):
+    total_bytes = 0
+    for param in model.parameters():
+        if param.grad is not None:
+            total_bytes += param.grad.numel() * param.grad.element_size()
+    return total_bytes
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -135,86 +143,101 @@ class LoggerAggregator:
             wandb.log(log_dict, step=step)
 
 
-@contextlib.contextmanager
-def ProfilingContext(
-    batch_size, step, cfg, enable_profiler=False, profiler_dir=None, warmup_steps=3
-):
+class ProfilingContext:
     """
-    Context manager for profiling a training step.
+    Context manager class for profiling a training step.
     Times the block, does CUDA sync, and (optionally) runs torch.profiler for a single step.
-    Returns a dict with timing and throughput info.
+    After exiting, results are available as ProfilingContext.results.
     """
-    if profiler_dir is None:
-        profiler_dir = getattr(cfg, "profiler_dir", "profiler_traces")
 
-    # Track if we've done warmup (static variable)
-    if not hasattr(ProfilingContext, "_warmup_done"):
-        ProfilingContext._warmup_done = False
+    _warmup_done = False
+    results = None
 
-    # Skip profiling if already done
-    if enable_profiler and ProfilingContext._warmup_done:
-        enable_profiler = False
-
-    if enable_profiler:
-        os.makedirs(profiler_dir, exist_ok=True)
-        prof = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU]
-            + (
-                [torch.profiler.ProfilerActivity.CUDA]
-                if torch.cuda.is_available()
-                else []
-            ),
-            schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_dir),
-            record_shapes=True,
-            with_stack=True,
+    def __init__(
+        self,
+        batch_size,
+        step,
+        cfg,
+        enable_profiler=False,
+        profiler_dir=None,
+        warmup_steps=3,
+    ):
+        self.batch_size = batch_size
+        self.step = step
+        self.cfg = cfg
+        self.enable_profiler = enable_profiler
+        self.profiler_dir = profiler_dir or getattr(
+            cfg, "profiler_dir", "profiler_traces"
         )
-        prof.__enter__()
-    else:
-        prof = None
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    start_time = time.time()
-    try:
-        yield
-    finally:
+        self.warmup_steps = warmup_steps
+        self.prof = None
+        self.start_time = None
+
+        # Skip profiling if already done
+        if self.enable_profiler and ProfilingContext._warmup_done:
+            self.enable_profiler = False
+
+    def __enter__(self):
+        if self.enable_profiler:
+            os.makedirs(self.profiler_dir, exist_ok=True)
+            self.prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+                + (
+                    [torch.profiler.ProfilerActivity.CUDA]
+                    if torch.cuda.is_available()
+                    else []
+                ),
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    self.profiler_dir
+                ),
+                record_shapes=True,
+                with_stack=True,
+            )
+            self.prof.__enter__()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        ex_per_sec = batch_size / elapsed if elapsed > 0 else float("nan")
-        # Try to get flops/sec if possible
-        flops_per_step = None
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.time() - self.start_time  # type: ignore
+        ex_per_sec = self.batch_size / elapsed if elapsed > 0 else float("nan")
         flops_per_sec = None
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            try:
-                flops_per_step = (
-                    torch.cuda.get_device_properties(
-                        torch.cuda.current_device()
-                    ).multi_processor_count
-                    * 2
-                    * batch_size
-                )
-                flops_per_sec = (
-                    flops_per_step / elapsed if elapsed > 0 else float("nan")
-                )
-            except Exception:
-                flops_per_step = None
-                flops_per_sec = None
-        if prof is not None:
-            prof.step()
-            prof.__exit__(None, None, None)
-            print(f"[PROFILER] Step {step}: trace written to {profiler_dir}")
+        if self.prof is not None:
+            self.prof.step()
+            self.prof.__exit__(None, None, None)
+            print(f"[PROFILER] Step {self.step}: trace written to {self.profiler_dir}")
             ProfilingContext._warmup_done = True
-        # Attach results to the context manager for access
+            # Get real flops from profiler output
+            try:
+                # Sum flops from all events if available
+                flops = 0
+                for evt in self.prof.key_averages():
+                    if hasattr(evt, 'flops'):
+                        flops += evt.flops
+                    elif hasattr(evt, '__dict__') and 'flops' in evt.__dict__:
+                        flops += evt.__dict__['flops']
+                if flops > 0 and elapsed > 0:
+                    flops_per_sec = flops / elapsed
+                else:
+                    flops_per_sec = -1
+            except Exception:
+                flops_per_sec = -1
+        else:
+            flops_per_sec = -1
+        # Attach results to the class for access
         ProfilingContext.results = {
             "step_time_cuda_sync": elapsed,
             "examples_per_sec": ex_per_sec,
-            "flops_per_sec": flops_per_sec if flops_per_sec is not None else -1,
+            "flops_per_sec": flops_per_sec,
         }
 
 
 @contextlib.contextmanager
-def WarmupContext(model, train_iter, cfg, training_step_fn, warmup_steps=3):
+def warmup_context(model, train_iter, cfg, training_step_fn, warmup_steps=3):
     """
     Context manager for warming up a model before profiling.
     Does warmup steps to ensure model is in steady state, then yields for profiling.
@@ -227,10 +250,10 @@ def WarmupContext(model, train_iter, cfg, training_step_fn, warmup_steps=3):
         warmup_steps: Number of warmup steps
     """
     # Track if we've done warmup (static variable)
-    if not hasattr(WarmupContext, "_warmup_done"):
-        WarmupContext._warmup_done = False
+    if not hasattr(warmup_context, "_warmup_done"):
+        warmup_context._warmup_done = False
 
-    if not WarmupContext._warmup_done:
+    if not warmup_context._warmup_done:
         print(f"[PROFILER] Warming up for {warmup_steps} steps...")
         model.train()
         for _ in range(warmup_steps):
@@ -239,7 +262,7 @@ def WarmupContext(model, train_iter, cfg, training_step_fn, warmup_steps=3):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         print("[PROFILER] Warmup complete")
-        WarmupContext._warmup_done = True
+        warmup_context._warmup_done = True
 
     try:
         yield
@@ -283,6 +306,7 @@ def profile_and_log_flamegraph(model, example_batch, cfg, logger, compute_loss=N
         + ([torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else []),
         record_shapes=True,
         with_stack=True,
+        with_flops=True,
     ) as prof:
         x, y, task_id = example_batch
         with torch.no_grad():
@@ -323,6 +347,7 @@ def profile_and_log_flamegraph_backward(
         + ([torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else []),
         record_shapes=True,
         with_stack=True,
+        with_flops=True,
     ) as prof:
         x, y, task_id = example_batch
         x = x.to(cfg.device)

@@ -5,6 +5,7 @@ gradient_accumulation_steps: 1
 num_examples_per_task_train: 10000
 num_examples_per_task_val: 500
 num_examples_per_task_test: 1000
+task_diversity: 0.5
 lr: 0.001
 opt_type: adam
 # Number of epochs to train (used if steps == -1)
@@ -25,7 +26,7 @@ wandb:
   notes: ${oc.env:WANDB_NOTES,null}
 
 # Task setup
-train_mode: sequential # mixed_batch, sequential
+train_mode: mixed_batch # mixed_batch, sequential
 num_tasks: 10
 val_interval: 100  # Validate every 100 steps
 

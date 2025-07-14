@@ -1,14 +1,15 @@
 import itertools
+import math
 import os
 import random
 import time
+from typing import Iterator, Literal
 
 import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 from sklearn.datasets import make_classification
@@ -19,18 +20,20 @@ from sklearn.metrics import (
     roc_curve,
 )
 from torch import nn
-from torch.optim import SGD, Adagrad, Adam, RMSprop
-from torch.utils.data import DataLoader, Dataset
+from torch.optim import SGD, Adagrad, Adam, RMSprop, SparseAdam
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 from tqdm import tqdm
 
+import wandb
 from utils import (
     LoggerAggregator,
     ProfilingContext,
-    WarmupContext,
     _resolve_device,
+    get_total_gradient_bytes,
     profile_and_log_flamegraph,
     profile_and_log_flamegraph_backward,
     set_seed,
+    warmup_context,
 )
 
 
@@ -45,8 +48,27 @@ def make_opt(model, cfg: DictConfig):
         return Adagrad(model.parameters(), lr=lr)
     elif opt_type == "rmsprop":
         return RMSprop(model.parameters(), lr=lr)
+    elif opt_type == "sparseadam":
+        return SparseAdam(model.parameters(), lr=lr)
     else:
         raise ValueError(f"Unknown optimizer type: {opt_type}")
+
+
+def make_embedding(
+    num_tasks: int,
+    n_features: int,
+    hidden_dim: int,
+    device: torch.device | None = None,
+    backend: Literal["default", "xformers"] = "default",
+    sparse: bool = False,
+) -> nn.Embedding | nn.EmbeddingBag:
+    if backend == "default":
+        emb = nn.Embedding(
+            num_tasks, hidden_dim * n_features, device=device, sparse=sparse
+        )
+    elif backend == "xformers":
+        emb = nn.EmbeddingBag(num_tasks, hidden_dim * n_features, device=device)
+    return emb
 
 
 class Dictionary(nn.Module):
@@ -56,15 +78,24 @@ class Dictionary(nn.Module):
         n_features: int,
         hidden_dim: int = 64,
         device: torch.device | None = None,
+        sparse: bool = False,
     ):
         super().__init__()
         self.num_tasks = num_tasks
         self.n_features = n_features
         self.hidden_dim = hidden_dim
-        self._l1_emb = nn.Embedding(num_tasks, hidden_dim * n_features, device=device)
-        self._l1_bias = nn.Embedding(num_tasks, hidden_dim, device=device)
-        self._l2_emb = nn.Embedding(num_tasks, hidden_dim, device=device)
-        self._l2_bias = nn.Embedding(num_tasks, 1, device=device)
+        self._l1_emb = make_embedding(
+            num_tasks, n_features, hidden_dim, device, backend="default", sparse=sparse
+        )
+        self._l1_bias = make_embedding(
+            num_tasks, 1, hidden_dim, device, backend="default", sparse=sparse
+        )
+        self._l2_emb = make_embedding(
+            num_tasks, hidden_dim, 1, device, backend="default", sparse=sparse
+        )
+        self._l2_bias = make_embedding(
+            num_tasks, 1, 1, device, backend="default", sparse=sparse
+        )
         self.act_fn = nn.GELU()
 
     def forward(self, x, task_ids):
@@ -243,6 +274,66 @@ class DatasetSplit(Dataset):
         return self.dataset[self.indices[idx]]
 
 
+class ControlledTaskDiversitySampler(BatchSampler):
+    def __init__(
+        self,
+        dataset: DatasetSplit,
+        batch_size: int,
+        num_tasks: int,
+        task_diversity: float,
+        drop_last: bool = False,
+        generator: torch.Generator | None = None,
+    ):
+        self.batch_size = batch_size
+        self.num_tasks = num_tasks
+        assert 0 <= task_diversity <= 1, "Task diversity must be between 0 and 1"
+        self.task_diversity = task_diversity
+        self.generator = generator
+        self.dataset = dataset
+        self.task_to_indices = {}
+
+        for idx in range(len(dataset)):
+            task = dataset.dataset.indices[idx][1]
+            self.task_to_indices.setdefault(task, []).append(idx)
+
+        self.tasks = list(self.task_to_indices.keys())
+        self.drop_last = drop_last
+
+        if task_diversity > 0.5:
+            self.tasks_per_batch = 1
+        else:
+            self.tasks_per_batch = min(
+                len(self.tasks), math.floor(1.0 / task_diversity)
+            )
+        self.num_batches = math.ceil(num_tasks / self.tasks_per_batch)
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        while True:
+            batch_tasks = random.sample(self.tasks, self.tasks_per_batch)
+            batch = []
+            for t in batch_tasks:
+                task_batch_indices = random.sample(
+                    self.task_to_indices[t], self.batch_size
+                )
+                batch.extend(task_batch_indices)
+
+            if len(batch) < self.batch_size:
+                # fill with random from any task
+                extras = random.choices(
+                    sum(self.task_to_indices.values(), []),
+                    k=self.batch_size - len(batch),
+                )
+                batch.extend(extras)
+
+            if not self.drop_last and len(batch) > self.batch_size:
+                batch = batch[: self.batch_size]
+
+            yield batch
+
+
 def collate_fn(batch):
     x, y, task_id = zip(*batch)
     return torch.stack(x), torch.stack(y), torch.tensor(task_id)
@@ -292,9 +383,23 @@ def make_dataloaders(cfg: DictConfig):
     val_dataset = DatasetSplit(full_dataset, val_indices)
     test_dataset = DatasetSplit(full_dataset, test_indices)
 
+    train_task_map = {}
+    for idx in range(len(train_dataset)):
+        task = train_dataset.dataset.indices[idx][1]
+        train_task_map.setdefault(task, []).append(idx)
+
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn
+        train_dataset,
+        collate_fn=collate_fn,
+        batch_sampler=ControlledTaskDiversitySampler(
+            num_tasks=cfg.num_tasks,
+            task_diversity=cfg.task_diversity,
+            batch_size=cfg.batch_size,
+            drop_last=True,
+            generator=torch.Generator().manual_seed(cfg.seed),
+            dataset=train_dataset,
+        ),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_fn
@@ -352,7 +457,7 @@ def train_one_task(
 
         # Use WarmupContext for profiling
         if enable_profiler:
-            with WarmupContext(
+            with warmup_context(
                 model, train_iter, cfg, training_step_fn=training_step_sequential
             ):
                 with ProfilingContext(batch_size, step, cfg, enable_profiler=True):
@@ -386,11 +491,14 @@ def train_one_task(
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg.max_grad_norm
         )
+        # Compute total_grad_bytes if needed
+        total_grad_bytes = get_total_gradient_bytes(model) if cfg.opt_type == "sparseadam" else None
         logger.log_dict(
             {
                 "train_loss": loss.item(),
                 "grad_norm": grad_norm.item(),
                 "lr": opt.param_groups[0]["lr"],
+                **({"total_grad_bytes": total_grad_bytes} if total_grad_bytes is not None else {}),
             },
             section=f"train_task_{task_id}",
             kind="scalar",
@@ -606,7 +714,13 @@ def train_mixed_batch(cfg: DictConfig):
     # Init on device
     device = _resolve_device(cfg.device)
 
-    model = Dictionary(cfg.num_tasks, cfg.n_features, cfg.hidden_dim, device=device)  # type: ignore
+    model = Dictionary(
+        cfg.num_tasks,
+        cfg.n_features,
+        cfg.hidden_dim,
+        device=device,
+        sparse=cfg.opt_type == "sparseadam",
+    )  # type: ignore
     train_loader, val_loader, test_loader = make_dataloaders(cfg)
     logger = LoggerAggregator(cfg)
     opt = make_opt(model, cfg)
@@ -630,7 +744,7 @@ def train_mixed_batch(cfg: DictConfig):
 
         # Use WarmupContext for profiling
         if enable_profiler:
-            with WarmupContext(
+            with warmup_context(
                 model, train_iter, cfg, training_step_fn=training_step_mixed_batch
             ):
                 with ProfilingContext(batch_size, step, cfg, enable_profiler=True):
@@ -659,11 +773,14 @@ def train_mixed_batch(cfg: DictConfig):
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg.max_grad_norm
         )
+        # Compute total_grad_bytes if needed
+        total_grad_bytes = get_total_gradient_bytes(model) if cfg.opt_type == "sparseadam" else None
         logger.log_dict(
             {
                 "train_loss": loss.item(),
                 "grad_norm": grad_norm.item(),
                 "lr": opt.param_groups[0]["lr"],
+                **({"total_grad_bytes": total_grad_bytes} if total_grad_bytes is not None else {}),
             },
             section="train",
             kind="scalar",
