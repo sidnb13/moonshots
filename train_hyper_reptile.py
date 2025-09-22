@@ -206,7 +206,7 @@ class TinyMLP(nn.Module):
 
 
 class HyperNetwork(nn.Module):
-    """Fast weight programmer with a shared generator head."""
+    """Fast weight programmer with a shared generator head. Can also act as a weight initializer for Regressor."""
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -233,24 +233,50 @@ class HyperNetwork(nn.Module):
             cfg.intermediate_dim,
             rank=cfg.rank,
         )
+        # For init mode: compute total number of params for Regressor
+        self.total_param_num = sum(
+            np.prod(w) + np.prod(b) for w, b in zip(self.layer_shapes, self.bias_shapes)
+        )
 
-    def forward(self, task_id: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, task_id: torch.Tensor, x: torch.Tensor = None, mode: str = "predict"
+    ) -> torch.Tensor:
         code = self.task_emb(task_id)  # [1, D]
-        out = x
-        for idx, (w_shape, b_shape) in enumerate(
-            zip(self.layer_shapes, self.bias_shapes)
-        ):
-            emb = self.layer_emb(torch.tensor(idx, device=task_id.device))  # [D]
-            inp = torch.cat([code.squeeze(0), emb], dim=-1)  # [2D]
-            params = self.gen(inp)  # [gen_out_dim]
-            w_num = np.prod(w_shape)
-            b_num = np.prod(b_shape)
-            wl = params[:w_num].view(*w_shape)
-            bl = params[w_num : w_num + b_num].view(*b_shape)
-            out = F.linear(out, wl, bl)
-            if idx < self.n_layers - 1:
-                out = torch.tanh(out)
-        return out
+        if mode == "predict":
+            assert x is not None, "x must be provided in predict mode"
+            out = x
+            for idx, (w_shape, b_shape) in enumerate(
+                zip(self.layer_shapes, self.bias_shapes)
+            ):
+                emb = self.layer_emb(torch.tensor(idx, device=task_id.device))  # [D]
+                inp = torch.cat([code.squeeze(0), emb], dim=-1)  # [2D]
+                params = self.gen(inp)  # [gen_out_dim]
+                w_num = np.prod(w_shape)
+                b_num = np.prod(b_shape)
+                wl = params[:w_num].view(*w_shape)
+                bl = params[w_num : w_num + b_num].view(*b_shape)
+                out = F.linear(out, wl, bl)
+                if idx < self.n_layers - 1:
+                    out = torch.tanh(out)
+            return out
+        elif mode == "init":
+            # Generate all weights and biases for the Regressor, concatenate into a single vector
+            param_vecs = []
+            for idx, (w_shape, b_shape) in enumerate(
+                zip(self.layer_shapes, self.bias_shapes)
+            ):
+                emb = self.layer_emb(torch.tensor(idx, device=task_id.device))
+                inp = torch.cat([code.squeeze(0), emb], dim=-1)
+                params = self.gen(inp)
+                w_num = np.prod(w_shape)
+                b_num = np.prod(b_shape)
+                wl = params[:w_num].view(-1)
+                bl = params[w_num : w_num + b_num].view(-1)
+                param_vecs.append(wl)
+                param_vecs.append(bl)
+            return torch.cat(param_vecs, dim=0)  # [total_param_num]
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
 
 def gen_task(rng: np.random.RandomState) -> Callable:
@@ -396,6 +422,124 @@ def hypernet_train_loop(
                 )
 
 
+def debug_compare_hypernet_predict_and_init(hypernet, model, task_id_tensor, x_all_tensor, device):
+    """Compare hypernet predict mode and init+Regressor outputs for sanity check."""
+    with torch.no_grad():
+        # Re-initialize model from hypernet init
+        param_vec = hypernet(task_id_tensor, mode="init")
+        param_idx = 0
+        for name, param in model.named_parameters():
+            param_size = param.numel()
+            param_data = param_vec[param_idx : param_idx + param_size]
+            param.data = param_data.view(param.shape)
+            param_idx += param_size
+        y_pred_regressor = model(x_all_tensor)
+        y_pred_hypernet = hypernet(task_id_tensor, x_all_tensor, mode="predict")
+        is_close = torch.allclose(y_pred_hypernet, y_pred_regressor, atol=1e-5)
+        print(f"[DEBUG] Hypernet predict vs. init+Regressor allclose: {is_close}")
+
+
+def hyper_reptile_train_loop(
+    hypernet: HyperNetwork,
+    cfg: DictConfig,
+    x_all: np.ndarray,
+    f_plot: Callable,
+    xtrain_plot: np.ndarray,
+    rng: np.random.RandomState,
+    logger: LoggerAggregator,
+    device: torch.device,
+):
+    print(f"Starting HyperReptile training for {cfg.outer_steps} iterations...")
+    pbar = tqdm(
+        range(cfg.outer_steps),
+        desc="HyperReptile-training",
+        disable=not cfg.pbar_interval,
+    )
+
+    opt = torch.optim.AdamW(
+        hypernet.parameters(),
+        lr=cfg.hypernet_lr,
+        weight_decay=cfg.hypernet_weight_decay,
+    )
+    for iteration in pbar:
+        # sample task and input data
+        task_id = rng.randint(0, cfg.num_tasks)
+        f = gen_task_from_id(task_id)
+        y_all = f(x_all)
+        inds = rng.permutation(len(x_all))[: cfg.ntrain]
+        x_mb = totorch(x_all[inds], device)
+        # y_mb = totorch(y_all[inds], device)
+        task_id_tensor = torch.tensor([task_id], dtype=torch.long, device=device)
+
+        # initialize new model
+        model = Regressor(cfg)
+        # Set model parameters from hypernet-generated weights (init mode)
+        with torch.no_grad():
+            param_vec = hypernet(task_id_tensor, x_mb, mode="init")
+            param_idx = 0
+            for name, param in model.named_parameters():
+                param_size = param.numel()
+                param_data = param_vec[param_idx : param_idx + param_size]
+                param.data = param_data.view(param.shape)
+                param_idx += param_size
+
+        # Make an initial prediction (use hypernet in predict mode for grad flow)
+        x_all_tensor = totorch(x_all, device)
+        y_pred_init = hypernet(task_id_tensor, x_all_tensor, mode="predict")
+
+        weights_before = deepcopy(model.state_dict())
+        # Use the same task_id for the inner loop as the outer loop
+        f = gen_task_from_id(task_id)
+        y_all = f(x_all)
+        inds = rng.permutation(len(x_all))
+        for start in range(0, len(x_all), cfg.ntrain):
+            mbinds = inds[start : start + cfg.ntrain]
+            train_on_batch(
+                model, x_all[mbinds], y_all[mbinds], cfg.inner_stepsize, device
+            )
+        weights_after = model.state_dict()
+
+        y_pred_post = model(totorch(x_all, device)).detach()
+
+        outerstepsize = cfg.outerstepsize * (1 - iteration / cfg.outer_steps)
+        model.load_state_dict(
+            {
+                name: weights_before[name]
+                + (weights_after[name] - weights_before[name]) * outerstepsize
+                for name in weights_before
+            }
+        )
+
+        loss_inner = (y_pred_post - y_pred_init).pow(2).mean()
+
+        loss_inner.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(hypernet.parameters(), max_norm=1.0)
+        opt.step()
+
+        if (iteration + 1) % cfg.pbar_interval == 0:
+            pbar.set_postfix({"loss": f"{loss_inner:.4f}"})
+
+        logger.log_dict(
+            {"inner_loop_loss": loss_inner, "grad_norm": grad_norm},
+            section="training",
+            kind="scalar",
+            step=iteration,
+        )
+
+        if cfg.plot and (iteration == 0 or (iteration + 1) % cfg.plot_interval == 0):
+            plot_results(
+                model,
+                x_all,
+                f_plot,
+                xtrain_plot,
+                iteration,
+                cfg,
+                logger,
+                device,
+                prefix="hyper_reptile",
+            )
+
+
 def meta_train_loop(
     model: nn.Module,
     cfg: DictConfig,
@@ -491,6 +635,12 @@ def main(cfg: DictConfig):
         hypernet = HyperNetwork(cfg)
         hypernet.to(device)
         hypernet_train_loop(
+            hypernet, cfg, x_all, f_plot, xtrain_plot, rng, logger, device
+        )
+    elif cfg.mode == "hyper_reptile":
+        hypernet = HyperNetwork(cfg)
+        hypernet.to(device)
+        hyper_reptile_train_loop(
             hypernet, cfg, x_all, f_plot, xtrain_plot, rng, logger, device
         )
     else:
